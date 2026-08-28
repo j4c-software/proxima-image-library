@@ -178,13 +178,20 @@ Rules:
 - If an important aspect of the image has no good match in the list, you may suggest \
 up to 2 new tags by prefixing them with '?' (e.g. ?rooftop-garden)
 - Suggested tags must be lowercase and hyphenated (no spaces or special characters)
-- Return ONLY a comma-separated list, nothing else
 - No punctuation other than commas and the '?' suggestion prefix"""
 
             if context:
                 prompt += f"\nContext: {context}"
+            prompt += "\n\nReturn exactly one line: TAGS: <comma-separated list>. Do not include any other text, reasoning, or lines."
 
-            return self._vision_message(source, filename, prompt)
+            raw = self._vision_message(source, filename, prompt) or ""
+            for line in raw.splitlines():
+                line = line.strip()
+                if line.upper().startswith("TAGS:"):
+                    return line[len("TAGS:"):].strip() or None
+            # Fallback for legacy/malformed responses: use the last non-empty line only.
+            lines = [l.strip() for l in raw.splitlines() if l.strip()]
+            return lines[-1] if lines else None
 
         except Exception as e:
             print(f"Error generating tags for {filename or source}: {e}")

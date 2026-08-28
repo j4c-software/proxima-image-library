@@ -4280,24 +4280,8 @@
         return;
       }
       section.classList.remove('tm-hidden');
-      const categories = Object.keys(_tmLibrary).concat(['Custom']);
-      el.innerHTML = suggestions.map(s => {
-        const sugCat = s.suggested_category || 'Custom';
-        const isMatched = sugCat !== 'Custom';
-        const matchBadge = isMatched
-          ? `<span title="Matched to vocabulary" style="font-size:0.68rem;color:#28a745;font-weight:600;white-space:nowrap;">↳ ${sugCat}</span>`
-          : `<span style="font-size:0.68rem;color:#aaa;white-space:nowrap;">no match</span>`;
-        const opts = categories.map(c => `<option value="${c}"${c === sugCat ? ' selected' : ''}>${c}</option>`).join('');
-        return `
-          <div class="tm-suggestion-item" id="tm-sug-${s.tag.replace('?','')}">
-            <span class="tm-suggestion-tag">${s.tag}</span>
-            <span class="tm-suggestion-count">${s.count} image${s.count !== 1 ? 's' : ''}</span>
-            ${matchBadge}
-            <select class="tm-suggestion-category" id="tm-cat-${s.tag.replace('?','')}">${opts}</select>
-            <button class="tm-btn-sm tm-btn-promote" onclick="tmPromote('${s.tag}')">Approve</button>
-            <button class="tm-btn-sm tm-btn-discard" onclick="tmDiscard('${s.tag}')">Discard</button>
-          </div>`;
-      }).join('');
+      const categories = tmCategoryOptions();
+      el.innerHTML = suggestions.map((s, i) => tmRenderSuggestionRow(s, categories, i)).join('');
     }
 
     async function tmLoadSuggestions() {
@@ -4310,42 +4294,67 @@
         return;
       }
       section.classList.remove('tm-hidden');
-      const categories = Object.keys(_tmLibrary).concat(['Custom']);
-      el.innerHTML = suggestions.map(s => {
-        const sugCat = s.suggested_category || 'Custom';
-        const isMatched = sugCat !== 'Custom';
-        const matchBadge = isMatched
-          ? `<span title="Matched to vocabulary" style="font-size:0.68rem;color:#28a745;font-weight:600;white-space:nowrap;">↳ ${sugCat}</span>`
-          : `<span style="font-size:0.68rem;color:#aaa;white-space:nowrap;">no match</span>`;
-        const opts = categories.map(c => `<option value="${c}"${c === sugCat ? ' selected' : ''}>${c}</option>`).join('');
-        return `
-          <div class="tm-suggestion-item" id="tm-sug-${s.tag.replace('?','')}">
-            <span class="tm-suggestion-tag">${s.tag}</span>
+      const categories = tmCategoryOptions();
+      el.innerHTML = suggestions.map((s, i) => tmRenderSuggestionRow(s, categories, i)).join('');
+    }
+
+    // Renders one suggestion row. Uses a data-tag attribute (escaped) plus
+    // event delegation instead of inline onclick — AI-generated tag text can
+    // occasionally contain stray newlines/quotes that would otherwise break
+    // an inline onclick="...('${tag}')" handler and silently disable the row.
+    function tmRenderSuggestionRow(s, categories, index) {
+      const sugCat = s.suggested_category || 'Custom';
+      const isMatched = sugCat !== 'Custom';
+      const matchBadge = isMatched
+        ? `<span title="Matched to vocabulary" style="font-size:0.68rem;color:#28a745;font-weight:600;white-space:nowrap;">↳ ${tmEscapeHtml(sugCat)}</span>`
+        : `<span style="font-size:0.68rem;color:#aaa;white-space:nowrap;">no match</span>`;
+      const opts = categories.map(c => `<option value="${tmEscapeHtml(c)}"${c === sugCat ? ' selected' : ''}>${tmEscapeHtml(c)}</option>`).join('');
+      return `
+          <div class="tm-suggestion-item" id="tm-sug-${index}" data-tag="${tmEscapeHtml(s.tag)}">
+            <span class="tm-suggestion-tag">${tmEscapeHtml(s.tag)}</span>
             <span class="tm-suggestion-count">${s.count} image${s.count !== 1 ? 's' : ''}</span>
             ${matchBadge}
-            <select class="tm-suggestion-category" id="tm-cat-${s.tag.replace('?','')}">${opts}</select>
-            <button class="tm-btn-sm tm-btn-promote" onclick="tmPromote('${s.tag}')">Approve</button>
-            <button class="tm-btn-sm tm-btn-discard" onclick="tmDiscard('${s.tag}')">Discard</button>
+            <select class="tm-suggestion-category">${opts}</select>
+            <button class="tm-btn-sm tm-btn-promote" data-tm-action="promote">Approve</button>
+            <button class="tm-btn-sm tm-btn-discard" data-tm-action="discard">Discard</button>
           </div>`;
-      }).join('');
     }
+
+    // Delegated click handler — works regardless of tag content since we
+    // never build inline event handler strings from tag text.
+    document.getElementById('tm-suggestions-list').addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-tm-action]');
+      if (!btn) return;
+      const item = btn.closest('.tm-suggestion-item');
+      if (!item) return;
+      if (btn.dataset.tmAction === 'promote') tmPromote(item);
+      else if (btn.dataset.tmAction === 'discard') tmDiscard(item);
+    });
 
     function tmRenderLibrary() {
       const grid = document.getElementById('tm-category-grid');
       if (!Object.keys(_tmLibrary).length) { grid.innerHTML = '<span class="tm-empty">No tags yet.</span>'; return; }
       grid.innerHTML = Object.entries(_tmLibrary).map(([cat, tags]) => `
         <div class="tm-category-card">
-          <div class="tm-category-name">${cat}</div>
+          <div class="tm-category-name">${tmEscapeHtml(cat)}</div>
           <div class="tm-tag-list">
-            ${tags.map(t => `<span class="tm-tag">${t}<button class="tm-remove-btn" onclick="tmRemoveTag('${t}')" title="Remove">✕</button></span>`).join('') || '<span class="tm-empty">Empty</span>'}
+            ${tags.map(t => `<span class="tm-tag" data-tag="${tmEscapeHtml(t)}">${tmEscapeHtml(t)}<button class="tm-remove-btn" data-tm-action="remove" title="Remove">✕</button></span>`).join('') || '<span class="tm-empty">Empty</span>'}
           </div>
         </div>
       `).join('');
     }
 
+    document.getElementById('tm-category-grid').addEventListener('click', (e) => {
+      const btn = e.target.closest('[data-tm-action="remove"]');
+      if (!btn) return;
+      const span = btn.closest('.tm-tag');
+      if (!span) return;
+      tmRemoveTag(span.dataset.tag);
+    });
+
     function tmPopulateCategorySelect() {
-      const cats = Object.keys(_tmLibrary).concat(['Custom']);
-      const opts = cats.map(c => `<option value="${c}">${c}</option>`).join('');
+      const cats = tmCategoryOptions();
+      const opts = cats.map(c => `<option value="${tmEscapeHtml(c)}">${tmEscapeHtml(c)}</option>`).join('');
       const sel = document.getElementById('tm-new-category');
       if (sel) sel.innerHTML = opts;
     }
@@ -4367,9 +4376,10 @@
       await tmLoadLibrary();
     }
 
-    async function tmPromote(tag) {
+    async function tmPromote(item) {
+      const tag = item.dataset.tag;
       const clean = tag.replace('?', '');
-      const category = document.getElementById(`tm-cat-${clean}`)?.value || 'Custom';
+      const category = item.querySelector('.tm-suggestion-category')?.value || 'Custom';
       await fetch('/api/tag-library/promote', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ tag, category }) });
       await tmLoadLibrary();
       const remaining = document.querySelectorAll('.tm-suggestion-item').length - 1;
@@ -4381,10 +4391,9 @@
       }
     }
 
-    async function tmDiscard(tag) {
-      const clean = tag.replace('?', '');
-      const el = document.getElementById(`tm-sug-${clean}`);
-      if (el) el.style.opacity = '0.4';
+    async function tmDiscard(item) {
+      const tag = item.dataset.tag;
+      item.style.opacity = '0.4';
       try {
         await fetch('/api/tag-library/discard-suggestion', {
           method: 'POST',
@@ -4392,7 +4401,7 @@
           body: JSON.stringify({ tag }),
         });
       } catch (e) { /* non-fatal */ }
-      el?.remove();
+      item.remove();
       tmShowToast(`Discarded "${tag}"`);
       if (!document.querySelector('.tm-suggestion-item')) {
         tmAcknowledgeAndCollapse('✓ No tags pending review.');
