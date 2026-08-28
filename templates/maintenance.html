@@ -141,6 +141,26 @@
     }
     .btn:hover { background: var(--accent-hover); }
     .btn:disabled { background: #8abfcc; cursor: not-allowed; }
+    .btn-working {
+      position: relative;
+      color: transparent !important;
+    }
+    .btn-working::after {
+      content: '';
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      width: 14px;
+      height: 14px;
+      margin: -7px 0 0 -7px;
+      border: 2px solid rgba(255, 255, 255, 0.5);
+      border-top-color: #fff;
+      border-radius: 50%;
+      animation: btn-working-spin 0.7s linear infinite;
+    }
+    @keyframes btn-working-spin {
+      to { transform: rotate(360deg); }
+    }
     .btn-danger {
       background: var(--danger);
     }
@@ -2455,7 +2475,15 @@
       onSuccess,
       onFailure,
     }) {
-      if (button) button.disabled = true;
+      let originalButtonText = null;
+      if (button) {
+        button.disabled = true;
+        originalButtonText = button.textContent;
+        button.dataset.originalText = originalButtonText;
+        button.classList.add('btn-working');
+        button.setAttribute('aria-busy', 'true');
+        button.title = 'Working — please wait, this is not hung.';
+      }
       disableButtons.forEach((el) => {
         if (el) el.disabled = true;
       });
@@ -2485,7 +2513,13 @@
         onFailure(err);
       } finally {
         if (ticker) clearInterval(ticker);
-        if (button) button.disabled = false;
+        if (button) {
+          button.disabled = false;
+          button.classList.remove('btn-working');
+          button.removeAttribute('aria-busy');
+          button.title = '';
+          button.textContent = button.dataset.originalText || originalButtonText;
+        }
       }
     }
 
@@ -2542,6 +2576,7 @@
           duplicatesSummaryEl.classList.remove('line-err');
           duplicatesSummaryEl.textContent = 'Scanning for duplicate groups...';
         },
+        timerEl: duplicatesSummaryEl,
         requestUrl: `/api/maintenance/duplicates?${params.toString()}`,
         onSuccess: renderDuplicateScan,
         onFailure: (err) => resetDuplicateUi(err.message || 'Duplicate scan failed.', true),
