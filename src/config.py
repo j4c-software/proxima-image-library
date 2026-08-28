@@ -131,6 +131,7 @@ class Config:
             "SHAREPOINT_CLIENT_SECRET",
             "SHAREPOINT_SITE_ID",
             "SHAREPOINT_DRIVE_ID",
+            "MCP_INTERNAL_SECRET",
         ]
         missing = [key for key in required if not os.getenv(key)]
         if missing:

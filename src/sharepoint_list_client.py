@@ -36,6 +36,7 @@ class SharePointListClient(SharePointClient):
         "High-Res Location": "HighResLocation",
         "Source": "Source",
         "Ingest Source": "IngestSource",
+        "Image Hash": "ImageHash",
     }
 
     # SharePoint internal column name → app field name
@@ -117,6 +118,7 @@ class SharePointListClient(SharePointClient):
         high_res_location: str = "",
         source: str = "Internal",
         ingest_source: str = "",
+        image_hash: str = "",
     ) -> Optional[Dict]:
         fields = {
             "Title": filename,
@@ -130,6 +132,8 @@ class SharePointListClient(SharePointClient):
         }
         if ingest_source:
             fields["IngestSource"] = ingest_source
+        if image_hash:
+            fields["ImageHash"] = image_hash
         try:
             resp = requests.post(
                 f"{self._list_url}/items",

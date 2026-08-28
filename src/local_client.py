@@ -73,6 +73,7 @@ class LocalClient:
         high_res_location: str = "",
         source: str = "Internal",
         ingest_source: str = "",
+        image_hash: str = "",
     ) -> Optional[Dict]:
         records = self._load()
         record = {
@@ -90,6 +91,8 @@ class LocalClient:
         }
         if ingest_source:
             record["fields"]["Ingest Source"] = ingest_source
+        if image_hash:
+            record["fields"]["Image Hash"] = image_hash
         if image_url:
             record["fields"]["Image"] = [{"url": image_url}]
         records.append(record)
@@ -97,13 +100,14 @@ class LocalClient:
         return record
 
     def update_record(self, record_id: str, alt_text: str, status: str = "reviewed") -> bool:
-        records = self._load()
-        for r in records:
-            if r["id"] == record_id:
-                r["fields"]["Alt Text"] = alt_text
-                r["fields"]["Status"] = status
-                self._save(records)
-                return True
+        with _LOCK:
+            records = self._load()
+            for r in records:
+                if r["id"] == record_id:
+                    r["fields"]["Alt Text"] = alt_text
+                    r["fields"]["Status"] = status
+                    self._save(records)
+                    return True
         return False
 
 

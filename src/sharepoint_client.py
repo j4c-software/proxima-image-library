@@ -126,7 +126,9 @@ class SharePointClient:
         Reads from local OneDrive sync when available to avoid an API round-trip.
         """
         if self._local_base is not None:
-            local_file = self._local_base / sharepoint_path
+            local_file = (self._local_base / sharepoint_path).resolve()
+            if not local_file.is_relative_to(self._local_base.resolve()):
+                raise ValueError(f"Path escapes local base: {sharepoint_path}")
             if local_file.is_file():
                 return local_file.read_bytes()
         url = f"{self.GRAPH_BASE}/drives/{self.drive_id}/root:/{sharepoint_path}:/content"

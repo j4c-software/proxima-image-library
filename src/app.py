@@ -35,6 +35,37 @@ from werkzeug.exceptions import RequestEntityTooLarge
 from src.local_client import LocalClient
 from src.config import Config
 from src import ingest_poller
+from src.maintenance_helpers import (
+    MAINTENANCE_PURGE_STATUSES as _MAINTENANCE_PURGE_STATUSES,
+    MAINTENANCE_CANONICAL_CATEGORIES as _MAINTENANCE_CANONICAL_CATEGORIES,
+    MAINTENANCE_CATEGORY_ALIASES as _MAINTENANCE_CATEGORY_ALIASES,
+    MAINTENANCE_STATE_LOCK as _MAINTENANCE_STATE_LOCK,
+    MAINTENANCE_STATE_PATH as _MAINTENANCE_STATE_PATH,
+    MAINTENANCE_CHECKPOINT_DIR as _MAINTENANCE_CHECKPOINT_DIR,
+    now_utc_iso as _now_utc_iso,
+    atomic_json_write as _atomic_json_write,
+    sanitize_relative_path as _sanitize_relative_path,
+    normalize_filter_key as _normalize_filter_key,
+    normalize_compare_text as _normalize_compare_text,
+    parse_iso_date as _parse_iso_date,
+    record_date_value as _record_date_value,
+    category_from_location as _category_from_location,
+    canonical_category_name as _canonical_category_name,
+    record_for_duplicate_scan as _record_for_duplicate_scan,
+    maintenance_default_guardrails as _maintenance_default_guardrails,
+    maintenance_default_state as _maintenance_default_state,
+    maintenance_load_state as _maintenance_load_state,
+    maintenance_save_state as _maintenance_save_state,
+    maintenance_record_hash as _maintenance_record_hash,
+    maintenance_guardrails as _maintenance_guardrails,
+    build_integrity_scorecard as _build_integrity_scorecard,
+    collect_drift_candidates as _collect_drift_candidates,
+    build_category_normalization_preview as _build_category_normalization_preview,
+    run_named_maintenance_job as _run_named_maintenance_job,
+    build_exact_duplicate_groups as _build_exact_duplicate_groups,
+    build_near_alt_duplicate_groups as _build_near_alt_duplicate_groups,
+    collect_duplicate_snapshot as _collect_duplicate_snapshot_helper,
+)
 
 load_dotenv()
 Config.validate_runtime()
@@ -199,12 +230,18 @@ def handle_request_too_large(_exc):
         return jsonify({"error": message}), 413
     return Response(message, status=413)
 
-def _msal_app():
-    return msal.ConfidentialClientApplication(
-        Config.MSAL_CLIENT_ID,
-        authority=Config.MSAL_AUTHORITY,
-        client_credential=Config.MSAL_CLIENT_SECRET,
-    )
+_msal_app_instance: Optional[msal.ConfidentialClientApplication] = None
+
+
+def _msal_app() -> msal.ConfidentialClientApplication:
+    global _msal_app_instance
+    if _msal_app_instance is None:
+        _msal_app_instance = msal.ConfidentialClientApplication(
+            Config.MSAL_CLIENT_ID,
+            authority=Config.MSAL_AUTHORITY,
+            client_credential=Config.MSAL_CLIENT_SECRET,
+        )
+    return _msal_app_instance
 
 
 def _is_bypass_session_user(user_claims: Optional[Dict]) -> bool:
@@ -291,7 +328,7 @@ def enforce_csrf_protection():
     if request.method in {"POST", "PUT", "PATCH", "DELETE"} and not _same_origin_request():
         return _csrf_error("Invalid request origin")
 
-    if path in _CSRF_QUERY_REQUIRED_PATHS and "_csrf_token" in session:
+    if path in _CSRF_QUERY_REQUIRED_PATHS:
         token = (request.args.get("csrf_token", "") or "").strip()
         if not _valid_csrf_token(token):
             return _csrf_error("Missing or invalid CSRF token")
@@ -453,6 +490,42 @@ _cache_time: float = 0
 CACHE_TTL = 300  # 5-minute cache
 
 
+def _sse_safe(s: str) -> str:
+    """Strip characters that could inject fake SSE event boundaries."""
+    return s.replace("\r", "").replace("\n", " ")
+
+
+def _sse_poll_loop(t: threading.Thread, q: "queue.Queue", timeout_seconds: int,
+                   timeout_msg: str, invalidate_cache: bool = False):
+    """Yield SSE events from a worker queue until done/error/timeout.
+
+    Replaces the repeated while-True polling pattern across SSE streaming routes.
+    Call after starting the worker thread:
+        yield from _sse_poll_loop(t, q, 180, "timed out after 3 minutes")
+    """
+    while True:
+        try:
+            kind, value = q.get(timeout=timeout_seconds)
+        except queue.Empty:
+            yield f"data: [ERROR] {_sse_safe(timeout_msg)}\n\n"
+            break
+
+        if kind == "progress":
+            yield f"data: {_sse_safe(value)}\n\n"
+        elif kind == "done":
+            if invalidate_cache:
+                global _records_cache
+                _records_cache = None
+            yield f"data: [RESULT] {json.dumps(value, ensure_ascii=False)}\n\n"
+            yield "data: [DONE]\n\n"
+            break
+        elif kind == "error":
+            yield f"data: [ERROR] {_sse_safe(value)}\n\n"
+            break
+
+    t.join(timeout=5)
+
+
 def get_client():
     global _client
     if _client is None:
@@ -495,6 +568,33 @@ def api_version():
     except Exception:
         sha, short = "unknown", "unknown"
     return jsonify({"commit": sha, "short": short})
+
+
+@app.route("/debug/metrics")
+@login_required
+def debug_metrics():
+    """Admin-only endpoint for stress testing and ops monitoring.
+
+    Returns in-process state: memory, cache size, thread count, URL cache size.
+    """
+    if not _is_maintenance_admin_user(session.get("user", {})):
+        return jsonify({"error": "Admin access required"}), 403
+
+    import os
+    try:
+        import psutil
+        proc = psutil.Process(os.getpid())
+        rss_mb = proc.memory_info().rss / 1_048_576
+    except ImportError:
+        rss_mb = None
+
+    return jsonify({
+        "rss_mb": round(rss_mb, 1) if rss_mb is not None else "psutil not installed",
+        "sp_url_cache_size": len(_sp_url_cache),
+        "records_cache_live": _records_cache is not None,
+        "records_cache_size": len(_records_cache) if _records_cache else 0,
+        "active_threads": threading.active_count(),
+    })
 
 
 @app.route("/")
@@ -810,24 +910,7 @@ def api_catalog_stock():
 
         t = threading.Thread(target=worker, daemon=True)
         t.start()
-
-        while True:
-            try:
-                kind, value = q.get(timeout=180)
-            except queue.Empty:
-                yield "data: [ERROR] Processing timed out after 3 minutes\n\n"
-                break
-
-            if kind == "progress":
-                yield f"data: {value}\n\n"
-            elif kind == "done":
-                import json as _json
-                yield f"data: [RESULT] {_json.dumps(value, ensure_ascii=False)}\n\n"
-                yield "data: [DONE]\n\n"
-                break
-            elif kind == "error":
-                yield f"data: [ERROR] {value}\n\n"
-                break
+        yield from _sse_poll_loop(t, q, 180, "Processing timed out after 3 minutes")
 
     return Response(stream_with_context(generate()), mimetype="text/event-stream",
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
@@ -1911,6 +1994,9 @@ def api_image_info():
 @login_required
 def api_image_delete():
     """Delete a single image record and its associated files."""
+    if not _is_maintenance_admin_user(session.get("user", {})):
+        return jsonify({"error": "Admin access required"}), 403
+
     data = request.get_json(force=True) or {}
     record_id = str(data.get("record_id", "")).strip()
     delete_files = _as_bool(data.get("delete_files", True))
@@ -1968,8 +2054,6 @@ def image():
     return _serve_image(thumb=False)
 
 
-
-
 _sp_url_cache: dict[str, tuple[str, float]] = {}  # key → (url, expires_at)
 _SP_URL_TTL = 2700  # 45 minutes (SharePoint CDN URLs expire ~1 hour)
 
@@ -1981,6 +2065,16 @@ def _get_sp_url(sp_path: str, thumb: bool) -> str:
     if cached and cached[1] > time.time():
         return cached[0]
     url = get_sp_client().get_thumbnail_url(sp_path) if thumb else get_sp_client().get_file_url(sp_path)
+    if len(_sp_url_cache) >= 500:
+        # Evict expired entries; if still full, drop the oldest 125
+        now = time.time()
+        expired = [k for k, (_, exp) in _sp_url_cache.items() if exp <= now]
+        for k in expired:
+            del _sp_url_cache[k]
+        if len(_sp_url_cache) >= 500:
+            oldest = sorted(_sp_url_cache, key=lambda k: _sp_url_cache[k][1])[:125]
+            for k in oldest:
+                del _sp_url_cache[k]
     _sp_url_cache[cache_key] = (url, time.time() + _SP_URL_TTL)
     return url
 
@@ -2066,130 +2160,6 @@ def maintenance():
     return render_template("maintenance.html", user=user, is_admin=is_admin)
 
 
-_MAINTENANCE_PURGE_STATUSES = {"rejected", "archived", "ingested"}
-_MAINTENANCE_CANONICAL_CATEGORIES = [
-    "Headshots",
-    "Community",
-    "Locations",
-    "Situations",
-    "Graphics",
-    "Banners",
-]
-_MAINTENANCE_CATEGORY_ALIASES = {
-    "headshot": "Headshots",
-    "headshots": "Headshots",
-    "community": "Community",
-    "communities": "Community",
-    "location": "Locations",
-    "locations": "Locations",
-    "situation": "Situations",
-    "situations": "Situations",
-    "graphic": "Graphics",
-    "graphics": "Graphics",
-    "banner": "Banners",
-    "banners": "Banners",
-}
-
-_MAINTENANCE_STATE_LOCK = threading.Lock()
-_MAINTENANCE_STATE_PATH = Path(
-    "/home/proxima_maintenance_state.json"
-    if Path("/home").exists() and os.getenv("WEBSITE_INSTANCE_ID")
-    else "maintenance_state.json"
-)
-_MAINTENANCE_CHECKPOINT_DIR = Path(
-    "/home/proxima_maintenance_checkpoints"
-    if Path("/home").exists() and os.getenv("WEBSITE_INSTANCE_ID")
-    else "test_data/maintenance_checkpoints"
-)
-
-
-def _now_utc_iso() -> str:
-    return f"{datetime.utcnow().replace(microsecond=0).isoformat()}Z"
-
-
-def _maintenance_default_guardrails() -> Dict:
-    return {
-        "max_batch_size": 500,
-        "require_preview_for_destructive": True,
-        "two_step_approval_required": False,
-        "checkpoint_before_destructive": False,
-    }
-
-
-def _maintenance_default_state() -> Dict:
-    return {
-        "guardrails": _maintenance_default_guardrails(),
-        "jobs": {
-            "enabled": False,
-            "interval_minutes": 1440,
-            "job_names": [
-                "health_snapshot",
-                "integrity_scorecard",
-                "aging_drift_scan",
-            ],
-            "last_runs": {},
-        },
-        "audit_trail": [],
-        "checkpoints": [],
-        "approvals": [],
-    }
-
-
-def _atomic_json_write(path: Path, payload) -> None:
-    path = Path(path)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp_path = path.with_suffix(path.suffix + ".tmp")
-    with tmp_path.open("w", encoding="utf-8") as f:
-        json.dump(payload, f, indent=2, ensure_ascii=False)
-    tmp_path.replace(path)
-
-
-def _maintenance_load_state() -> Dict:
-    state = _maintenance_default_state()
-    try:
-        if _MAINTENANCE_STATE_PATH.exists():
-            loaded = json.loads(_MAINTENANCE_STATE_PATH.read_text(encoding="utf-8"))
-            if isinstance(loaded, dict):
-                state.update(loaded)
-    except Exception:
-        pass
-
-    guardrails = _maintenance_default_guardrails()
-    guardrails.update(state.get("guardrails", {}))
-    state["guardrails"] = guardrails
-
-    jobs = {
-        "enabled": False,
-        "interval_minutes": 1440,
-        "job_names": [
-            "health_snapshot",
-            "integrity_scorecard",
-            "aging_drift_scan",
-        ],
-        "last_runs": {},
-    }
-    jobs.update(state.get("jobs", {}))
-    if not isinstance(jobs.get("last_runs", {}), dict):
-        jobs["last_runs"] = {}
-    if not isinstance(jobs.get("job_names", []), list):
-        jobs["job_names"] = [
-            "health_snapshot",
-            "integrity_scorecard",
-            "aging_drift_scan",
-        ]
-    state["jobs"] = jobs
-
-    if not isinstance(state.get("audit_trail", []), list):
-        state["audit_trail"] = []
-    if not isinstance(state.get("checkpoints", []), list):
-        state["checkpoints"] = []
-    if not isinstance(state.get("approvals", []), list):
-        state["approvals"] = []
-    return state
-
-
-def _maintenance_save_state(state: Dict) -> None:
-    _atomic_json_write(_MAINTENANCE_STATE_PATH, state)
 
 
 def _maintenance_actor() -> str:
@@ -2198,11 +2168,6 @@ def _maintenance_actor() -> str:
     if identity_values:
         return sorted(identity_values)[0]
     return "local-dev" if _auth_bypass_enabled() else "unknown"
-
-
-def _maintenance_record_hash(record_ids: List[str]) -> str:
-    stable = "\n".join(sorted(str(rid).strip() for rid in record_ids if str(rid).strip()))
-    return hashlib.sha256(stable.encode("utf-8")).hexdigest()
 
 
 def _maintenance_append_audit(action: str, outcome: str, details: Dict) -> None:
@@ -2219,230 +2184,6 @@ def _maintenance_append_audit(action: str, outcome: str, details: Dict) -> None:
         })
         state["audit_trail"] = audit_trail[-500:]
         _maintenance_save_state(state)
-
-
-def _maintenance_guardrails() -> Dict:
-    with _MAINTENANCE_STATE_LOCK:
-        state = _maintenance_load_state()
-        guardrails = _maintenance_default_guardrails()
-        guardrails.update(state.get("guardrails", {}))
-        return guardrails
-
-
-def _category_from_location(location: str) -> str:
-    rel = _sanitize_relative_path(location)
-    if not rel:
-        return ""
-    parts = list(PurePosixPath(rel).parts)
-    if not parts:
-        return ""
-    return parts[0]
-
-
-def _canonical_category_name(raw: str) -> str:
-    key = _normalize_filter_key(raw)
-    if not key:
-        return ""
-    return _MAINTENANCE_CATEGORY_ALIASES.get(key, "")
-
-
-def _build_integrity_scorecard(records: List[Dict]) -> Dict:
-    categories: Dict[str, Dict] = {}
-    unknown_status_count = 0
-    valid_statuses = {"pending-review", "approved", "rejected", "archived"}
-
-    for rec in records:
-        fields = rec.get("fields", {})
-        category = _category_from_location(fields.get("Location", "")) or "Uncategorized"
-        bucket = categories.setdefault(category, {
-            "category": category,
-            "total": 0,
-            "missing_alt": 0,
-            "missing_tags": 0,
-            "missing_slug": 0,
-            "missing_location": 0,
-            "missing_high_res_location": 0,
-            "missing_source": 0,
-            "statuses": {
-                "pending-review": 0,
-                "approved": 0,
-                "rejected": 0,
-                "archived": 0,
-            },
-        })
-        bucket["total"] += 1
-
-        alt_text = str(fields.get("Alt Text", "") or "").strip()
-        tags = [t.strip() for t in str(fields.get("Tags", "") or "").split(",") if t.strip()]
-        slug = str(fields.get("Slug", "") or "").strip()
-        location = str(fields.get("Location", "") or "").strip()
-        high_res_location = str(fields.get("High-Res Location", "") or "").strip()
-        source = str(fields.get("Source", "") or "").strip()
-
-        if not alt_text:
-            bucket["missing_alt"] += 1
-        if not tags:
-            bucket["missing_tags"] += 1
-        if not slug:
-            bucket["missing_slug"] += 1
-        if not location:
-            bucket["missing_location"] += 1
-        if not high_res_location:
-            bucket["missing_high_res_location"] += 1
-        if not source:
-            bucket["missing_source"] += 1
-
-        status = str(fields.get("Status", "") or "").strip()
-        if status in bucket["statuses"]:
-            bucket["statuses"][status] += 1
-        if status not in valid_statuses:
-            unknown_status_count += 1
-
-    rows = []
-    for row in categories.values():
-        total = max(1, row["total"])
-        missing_total = (
-            row["missing_alt"]
-            + row["missing_tags"]
-            + row["missing_slug"]
-            + row["missing_location"]
-            + row["missing_high_res_location"]
-            + row["missing_source"]
-        )
-        row["integrity_score"] = round(max(0.0, 100.0 - ((missing_total / (total * 6)) * 100.0)), 1)
-        rows.append(row)
-
-    rows.sort(key=lambda r: (r["integrity_score"], r["category"].lower()))
-
-    return {
-        "generated_at": _now_utc_iso(),
-        "record_count": len(records),
-        "unknown_status_count": unknown_status_count,
-        "categories": rows,
-    }
-
-
-def _collect_drift_candidates(
-    records: List[Dict],
-    stale_pending_days: int = 14,
-    stale_approved_days: int = 180,
-    min_alt_chars: int = 40,
-    min_tag_count: int = 2,
-    limit: int = 200,
-) -> Dict:
-    today = date.today()
-    candidates = []
-    reason_counts: Dict[str, int] = {}
-
-    for rec in records:
-        fields = rec.get("fields", {})
-        rec_id = str(rec.get("id", "") or "").strip()
-        if not rec_id:
-            continue
-
-        filename = str(fields.get("Filename", "") or "").strip()
-        status = str(fields.get("Status", "") or "").strip()
-        alt_text = str(fields.get("Alt Text", "") or "").strip()
-        tags = [t.strip() for t in str(fields.get("Tags", "") or "").split(",") if t.strip()]
-        slug = str(fields.get("Slug", "") or "").strip()
-        source = str(fields.get("Source", "") or "").strip()
-        location = str(fields.get("Location", "") or "").strip()
-
-        reasons = []
-        rec_date = _record_date_value(rec)
-        days_old = (today - rec_date).days if rec_date is not None else None
-
-        if status == "pending-review" and days_old is not None and days_old >= stale_pending_days:
-            reasons.append("pending-review-stale")
-        if status == "approved" and days_old is not None and days_old >= stale_approved_days:
-            reasons.append("approved-stale")
-        if len(alt_text) < max(1, min_alt_chars):
-            reasons.append("short-alt")
-        if len(tags) < max(0, min_tag_count):
-            reasons.append("sparse-tags")
-        if any(t.lower() == "?missing-file" for t in tags):
-            reasons.append("missing-file-marker")
-        if not slug:
-            reasons.append("missing-slug")
-        if not source:
-            reasons.append("missing-source")
-        if not location:
-            reasons.append("missing-location")
-
-        if not reasons:
-            continue
-
-        for reason in reasons:
-            reason_counts[reason] = reason_counts.get(reason, 0) + 1
-
-        candidates.append({
-            "id": rec_id,
-            "filename": filename,
-            "status": status,
-            "location": location,
-            "category": _category_from_location(location),
-            "date": rec_date.isoformat() if rec_date is not None else "",
-            "days_old": days_old,
-            "reasons": reasons,
-        })
-
-    candidates.sort(key=lambda c: (
-        -len(c.get("reasons", [])),
-        -(c.get("days_old") or 0),
-        str(c.get("filename", "")).lower(),
-    ))
-
-    limit = max(10, min(int(limit), 2000))
-    return {
-        "generated_at": _now_utc_iso(),
-        "record_count": len(records),
-        "candidate_count": len(candidates),
-        "reason_counts": reason_counts,
-        "display_limit": limit,
-        "truncated": len(candidates) > limit,
-        "candidates": candidates[:limit],
-    }
-
-
-def _build_category_normalization_preview(records: List[Dict], limit: int = 200) -> Dict:
-    candidates = []
-    for rec in records:
-        fields = rec.get("fields", {})
-        rec_id = str(rec.get("id", "") or "").strip()
-        location = _sanitize_relative_path(fields.get("Location", ""))
-        if not rec_id or not location:
-            continue
-
-        parts = list(PurePosixPath(location).parts)
-        if not parts:
-            continue
-        current_category = parts[0]
-        canonical = _canonical_category_name(current_category)
-        if not canonical:
-            continue
-        if current_category == canonical:
-            continue
-
-        proposed_location = str(PurePosixPath(canonical, *parts[1:]))
-        candidates.append({
-            "id": rec_id,
-            "filename": str(fields.get("Filename", "") or "").strip(),
-            "current_category": current_category,
-            "normalized_category": canonical,
-            "current_location": location,
-            "proposed_location": proposed_location,
-            "status": str(fields.get("Status", "") or "").strip(),
-        })
-
-    candidates.sort(key=lambda c: (str(c.get("current_category", "")).lower(), str(c.get("filename", "")).lower()))
-    limit = max(10, min(int(limit), 2000))
-    return {
-        "generated_at": _now_utc_iso(),
-        "candidate_count": len(candidates),
-        "display_limit": limit,
-        "truncated": len(candidates) > limit,
-        "candidates": candidates[:limit],
-    }
 
 
 def _create_maintenance_checkpoint(name: str, note: str = "", records: Optional[List[Dict]] = None) -> Dict:
@@ -2583,44 +2324,6 @@ def _validate_destructive_guardrails(
     return None
 
 
-def _run_named_maintenance_job(job_name: str, records: List[Dict]) -> Dict:
-    if job_name == "health_snapshot":
-        health = {
-            "record_count": len(records),
-            "status_counts": {
-                "pending-review": sum(1 for r in records if str(r.get("fields", {}).get("Status", "")).strip() == "pending-review"),
-                "approved": sum(1 for r in records if str(r.get("fields", {}).get("Status", "")).strip() == "approved"),
-                "rejected": sum(1 for r in records if str(r.get("fields", {}).get("Status", "")).strip() == "rejected"),
-                "archived": sum(1 for r in records if str(r.get("fields", {}).get("Status", "")).strip() == "archived"),
-            },
-        }
-        return {"job": job_name, "summary": health}
-
-    if job_name == "integrity_scorecard":
-        scorecard = _build_integrity_scorecard(records)
-        return {
-            "job": job_name,
-            "summary": {
-                "record_count": scorecard.get("record_count", 0),
-                "category_count": len(scorecard.get("categories", [])),
-                "lowest_score": (scorecard.get("categories", [{}])[0] or {}).get("integrity_score", 100.0)
-                if scorecard.get("categories") else 100.0,
-            },
-        }
-
-    if job_name == "aging_drift_scan":
-        drift = _collect_drift_candidates(records, limit=200)
-        return {
-            "job": job_name,
-            "summary": {
-                "candidate_count": drift.get("candidate_count", 0),
-                "reason_counts": drift.get("reason_counts", {}),
-            },
-        }
-
-    raise ValueError(f"Unknown job_name: {job_name}")
-
-
 def _as_bool(value) -> bool:
     if isinstance(value, bool):
         return value
@@ -2681,16 +2384,6 @@ def _bulk_patch_fields(client, patches: List[tuple[str, Dict]]) -> Dict:
         else:
             failed_ids.append(record_id)
     return {"updated": updated, "failed_ids": failed_ids, "missing_ids": []}
-
-
-def _sanitize_relative_path(relative_path: str) -> str:
-    rel = str(relative_path or "").strip()
-    if not rel:
-        return ""
-    rel_posix = PurePosixPath(rel)
-    if rel_posix.is_absolute() or ".." in rel_posix.parts:
-        return ""
-    return str(rel_posix)
 
 
 def _safe_local_target(image_root: Path, area: str, relative_path: str) -> Optional[Path]:
@@ -2835,269 +2528,6 @@ def _collect_orphan_snapshot(limit: int = 200, records: Optional[List[Dict]] = N
             "orphaned_webp_files": len(orphaned_webp_files) > limit,
             "orphaned_high_res_files": len(orphaned_high_res_files) > limit,
         },
-    }
-
-
-def _normalize_compare_text(value: str) -> str:
-    text = str(value or "").strip().lower()
-    text = re.sub(r"[^a-z0-9]+", " ", text)
-    return " ".join(text.split())
-
-
-def _record_for_duplicate_scan(rec: Dict) -> Dict:
-    fields = rec.get("fields", {})
-    return {
-        "id": str(rec.get("id", "")).strip(),
-        "filename": str(fields.get("Filename", "")).strip(),
-        "slug": str(fields.get("Slug", "")).strip(),
-        "status": str(fields.get("Status", "")).strip(),
-        "alt_text": str(fields.get("Alt Text", "")).strip(),
-        "tags": str(fields.get("Tags", "")).strip(),
-        "location": str(fields.get("Location", "")).strip(),
-        "high_res_location": str(fields.get("High-Res Location", "")).strip(),
-        "source": str(fields.get("Source", "")).strip(),
-    }
-
-
-def _build_exact_duplicate_groups(scanned_records: List[Dict], field_name: str, group_type: str) -> List[Dict]:
-    buckets: Dict[str, Dict] = {}
-    for rec in scanned_records:
-        value = str(rec.get(field_name, "")).strip()
-        if not value:
-            continue
-        key = value.lower()
-        if key not in buckets:
-            buckets[key] = {"display": value, "records": []}
-        buckets[key]["records"].append(rec)
-
-    groups = []
-    for bucket in buckets.values():
-        if len(bucket["records"]) < 2:
-            continue
-        groups.append({
-            "group_type": group_type,
-            "key": bucket["display"],
-            "records": sorted(
-                bucket["records"],
-                key=lambda r: ((r.get("filename") or "").lower(), r.get("id") or ""),
-            ),
-        })
-
-    groups.sort(key=lambda g: (str(g.get("key", "")).lower(), len(g.get("records", [])) * -1))
-    return groups
-
-
-def _build_near_alt_duplicate_groups(scanned_records: List[Dict], threshold: float, window_size: int = 60) -> List[Dict]:
-    entries = []
-    for rec in scanned_records:
-        alt_norm = _normalize_compare_text(rec.get("alt_text", ""))
-        if alt_norm:
-            entries.append((rec.get("id", ""), alt_norm))
-
-    entries = [(rid, alt) for rid, alt in entries if rid]
-    if len(entries) < 2:
-        return []
-
-    # Compare only within a bounded lexical window to avoid O(n^2) growth
-    # on larger libraries while still catching highly similar neighboring strings.
-    entries.sort(key=lambda item: item[1])
-    window_size = max(10, min(int(window_size), 200))
-
-    parent = {rid: rid for rid, _ in entries}
-
-    def find(node: str) -> str:
-        while parent[node] != node:
-            parent[node] = parent[parent[node]]
-            node = parent[node]
-        return node
-
-    def union(a: str, b: str) -> None:
-        ra = find(a)
-        rb = find(b)
-        if ra != rb:
-            parent[rb] = ra
-
-    n = len(entries)
-    for i in range(n):
-        ida, alta = entries[i]
-        upper = min(n, i + 1 + window_size)
-        for j in range(i + 1, upper):
-            idb, altb = entries[j]
-            if alta == altb:
-                continue
-            if abs(len(alta) - len(altb)) > 24:
-                continue
-            if alta[0] != altb[0]:
-                continue
-            if SequenceMatcher(None, alta, altb).ratio() >= threshold:
-                union(ida, idb)
-
-    scanned_by_id = {rec.get("id", ""): rec for rec in scanned_records if rec.get("id", "")}
-    clusters: Dict[str, List[str]] = {}
-    for rid, _ in entries:
-        root = find(rid)
-        clusters.setdefault(root, []).append(rid)
-
-    groups = []
-    for cluster_ids in clusters.values():
-        unique_ids = sorted(set(cluster_ids))
-        if len(unique_ids) < 2:
-            continue
-        members = [scanned_by_id[rid] for rid in unique_ids if rid in scanned_by_id]
-        if len(members) < 2:
-            continue
-        members.sort(key=lambda r: ((r.get("filename") or "").lower(), r.get("id") or ""))
-        groups.append({
-            "group_type": "alt_near",
-            "key": f"similarity >= {threshold:.2f}",
-            "records": members,
-        })
-
-    groups.sort(key=lambda g: ((g.get("records", [{}])[0].get("filename") or "").lower(), len(g.get("records", [])) * -1))
-    return groups
-
-
-def _collect_duplicate_snapshot(
-    limit: int = 200,
-    include_near_alt: bool = True,
-    near_threshold: float = 0.92,
-    records: Optional[List[Dict]] = None,
-) -> Dict:
-    limit = max(10, min(limit, 1000))
-    near_threshold = max(0.80, min(near_threshold, 0.99))
-    record_pool = records if records is not None else _records_snapshot(use_cache=True)
-    scanned_records = [_record_for_duplicate_scan(r) for r in record_pool]
-
-    filename_groups = _build_exact_duplicate_groups(scanned_records, "filename", "filename")
-    slug_groups = _build_exact_duplicate_groups(scanned_records, "slug", "slug")
-
-    alt_exact_candidates = []
-    for rec in scanned_records:
-        alt_norm = _normalize_compare_text(rec.get("alt_text", ""))
-        if alt_norm:
-            clone = dict(rec)
-            clone["_alt_norm"] = alt_norm
-            alt_exact_candidates.append(clone)
-    alt_exact_groups = _build_exact_duplicate_groups(alt_exact_candidates, "_alt_norm", "alt_exact")
-    for group in alt_exact_groups:
-        for rec in group.get("records", []):
-            rec.pop("_alt_norm", None)
-
-    near_alt_groups = _build_near_alt_duplicate_groups(scanned_records, near_threshold) if include_near_alt else []
-
-    # Match records that share the same image stem — catches WebP record paired with
-    # a High-Res-only record where the High-Res filename is slug + "-original.ext".
-    image_stem_candidates = []
-    for rec in scanned_records:
-        slug = re.sub(r"\.[^.]+$", "", str(rec.get("slug") or "").strip())
-        if not slug:
-            # Derive from filename: strip -original suffix and extension
-            fn_stem = re.sub(r"\.[^.]+$", "", str(rec.get("filename") or "").strip())
-            fn_stem = re.sub(r"-original$", "", fn_stem)
-            slug = fn_stem
-        if not slug:
-            hr = str(rec.get("high_res_location") or "").strip()
-            if hr:
-                hr_stem = re.sub(r"\.[^.]+$", "", PurePosixPath(hr).name)
-                slug = re.sub(r"-original$", "", hr_stem)
-        if slug:
-            clone = dict(rec)
-            clone["_image_stem"] = slug.lower()
-            image_stem_candidates.append(clone)
-    image_stem_groups = _build_exact_duplicate_groups(image_stem_candidates, "_image_stem", "image_stem")
-    for group in image_stem_groups:
-        for rec in group.get("records", []):
-            rec.pop("_image_stem", None)
-    # Exclude image_stem groups already covered by filename/slug exact matches
-    covered_ids: set = set()
-    for g in filename_groups + slug_groups:
-        for rec in g.get("records", []):
-            covered_ids.add(rec.get("id", ""))
-    image_stem_groups = [
-        g for g in image_stem_groups
-        if not all(rec.get("id", "") in covered_ids for rec in g.get("records", []))
-    ]
-
-    # Match records that share both the same normalised alt text AND the same normalised tags.
-    # Requires both fields to be non-empty so we don't flood with untagged/un-alt'd records.
-    alt_tags_buckets: Dict[str, Dict] = {}
-    for rec in scanned_records:
-        alt_norm = _normalize_compare_text(rec.get("alt_text", ""))
-        tags_norm = _normalize_compare_text(rec.get("tags", ""))
-        if not alt_norm or not tags_norm:
-            continue
-        key = f"{alt_norm}||{tags_norm}"
-        if key not in alt_tags_buckets:
-            alt_tags_buckets[key] = {"display": key[:80], "records": []}
-        alt_tags_buckets[key]["records"].append(rec)
-    alt_tags_groups = [
-        {"group_type": "alt_and_tags", "key": b["display"], "records": sorted(
-            b["records"], key=lambda r: ((r.get("filename") or "").lower(), r.get("id") or "")
-        )}
-        for b in alt_tags_buckets.values() if len(b["records"]) >= 2
-    ]
-
-    # Match records with identical sorted tags AND near-duplicate alt text (≥0.85).
-    # Catches visually identical images that received slightly different alt text descriptions.
-    def _sorted_tags(tags_str: str) -> str:
-        return ",".join(sorted(t.strip().lower() for t in tags_str.split(",") if t.strip()))
-
-    _near_alt_tags_candidates = [
-        rec for rec in scanned_records
-        if _normalize_compare_text(rec.get("alt_text", "")) and rec.get("tags", "").strip()
-    ]
-    near_alt_tags_groups: list = []
-    _paired_near: set = set()
-    for i, ra in enumerate(_near_alt_tags_candidates):
-        for rb in _near_alt_tags_candidates[i + 1:]:
-            pair_key = tuple(sorted([ra.get("id", ""), rb.get("id", "")]))
-            if pair_key in _paired_near:
-                continue
-            if _sorted_tags(ra.get("tags", "")) != _sorted_tags(rb.get("tags", "")):
-                continue
-            alt_a = _normalize_compare_text(ra.get("alt_text", ""))
-            alt_b = _normalize_compare_text(rb.get("alt_text", ""))
-            if SequenceMatcher(None, alt_a, alt_b).ratio() >= 0.85:
-                _paired_near.add(pair_key)
-                near_alt_tags_groups.append({
-                    "group_type": "near_alt_and_tags",
-                    "key": f"near-alt+tags: {alt_a[:60]}",
-                    "records": sorted([ra, rb], key=lambda r: ((r.get("filename") or "").lower(), r.get("id") or "")),
-                })
-    # Exclude groups already fully covered by earlier passes
-    all_covered_ids: set = set()
-    for g in filename_groups + slug_groups + alt_exact_groups + image_stem_groups:
-        for rec in g.get("records", []):
-            all_covered_ids.add(rec.get("id", ""))
-    alt_tags_groups = [
-        g for g in alt_tags_groups
-        if not all(rec.get("id", "") in all_covered_ids for rec in g.get("records", []))
-    ]
-    near_alt_tags_groups = [
-        g for g in near_alt_tags_groups
-        if not all(rec.get("id", "") in all_covered_ids for rec in g.get("records", []))
-    ]
-
-    all_groups = filename_groups + slug_groups + alt_exact_groups + near_alt_groups + image_stem_groups + alt_tags_groups + near_alt_tags_groups
-    for idx, group in enumerate(all_groups, 1):
-        group["group_id"] = f"dup-{idx}"
-        group["count"] = len(group.get("records", []))
-
-    return {
-        "record_count": len(scanned_records),
-        "duplicate_group_count": len(all_groups),
-        "filename_group_count": len(filename_groups),
-        "slug_group_count": len(slug_groups),
-        "alt_exact_group_count": len(alt_exact_groups),
-        "alt_near_group_count": len(near_alt_groups),
-        "image_stem_group_count": len(image_stem_groups),
-        "alt_tags_group_count": len(alt_tags_groups),
-        "near_alt_tags_group_count": len(near_alt_tags_groups),
-        "include_near_alt": include_near_alt,
-        "near_threshold": near_threshold,
-        "groups": all_groups[:limit],
-        "display_limit": limit,
-        "truncated": len(all_groups) > limit,
     }
 
 
@@ -3585,11 +3015,11 @@ def api_maintenance_duplicates():
     try:
         records = _records_snapshot(use_cache=True)
         return jsonify(
-            _collect_duplicate_snapshot(
+            _collect_duplicate_snapshot_helper(
+                records,
                 limit=limit,
                 include_near_alt=include_near_alt,
                 near_threshold=near_threshold,
-                records=records,
             )
         )
     except Exception as exc:
@@ -3758,7 +3188,7 @@ def api_maintenance_duplicates_resolve_all():
     except (TypeError, ValueError):
         limit = 1000
 
-    snapshot = _collect_duplicate_snapshot(limit=limit, records=None)
+    snapshot = _collect_duplicate_snapshot_helper(_records_snapshot(use_cache=True), limit=limit)
     groups = snapshot.get("groups", [])
     if not groups:
         return jsonify({"error": "No duplicate groups found. Run a scan first."}), 400
@@ -3860,10 +3290,6 @@ def api_maintenance_duplicates_resolve_all():
     })
 
 
-def _normalize_filter_key(value: str) -> str:
-    return re.sub(r"[^a-z0-9]+", "", str(value or "").strip().lower())
-
-
 def _record_matches_retag_filters(rec: Dict, category_filter: str, tag_filters: List[str], status_filter: str) -> bool:
     fields = rec.get("fields", {})
 
@@ -3926,37 +3352,6 @@ def _get_retag_target_records(
         )
     )
     return matches[:max_records]
-
-
-def _parse_iso_date(raw: str) -> Optional[date]:
-    text = str(raw or "").strip()
-    if not text:
-        return None
-    try:
-        return datetime.fromisoformat(text).date()
-    except ValueError:
-        pass
-    try:
-        return datetime.fromisoformat(text.replace("Z", "+00:00")).date()
-    except ValueError:
-        return None
-
-
-def _record_date_value(rec: Dict) -> Optional[date]:
-    fields = rec.get("fields", {})
-    for key in [
-        "Date",
-        "Created",
-        "Created At",
-        "Updated",
-        "Updated At",
-        "Modified",
-        "Modified At",
-    ]:
-        parsed = _parse_iso_date(fields.get(key, ""))
-        if parsed is not None:
-            return parsed
-    return None
 
 
 def _status_reset_targets(
@@ -4371,27 +3766,39 @@ def api_maintenance_retag_run():
                         new_alt = current_alt
                         new_tags = current_tags
 
-                        if regenerate_alt:
-                            try:
-                                candidate_alt = gen._vision_message(
-                                    file_bytes, source_filename,
-                                    f"Analyze this image and generate a concise, descriptive alt text for web accessibility. "
-                                    f"Max 125 characters. Not starting with 'Image of'. Generate ONLY the alt text.",
-                                ).strip()
-                            except Exception as exc:
-                                raise ValueError(f"Alt text generation failed: {exc}") from exc
+                        if regenerate_alt and regenerate_tags:
+                            # Single API call for both fields
+                            candidate_alt, candidate_tags = gen.generate_alt_and_tags(
+                                file_bytes, filename=source_filename
+                            )
                             if not candidate_alt:
                                 raise ValueError("Alt text generation returned empty")
-                            new_alt = candidate_alt
-
-                        if regenerate_tags:
-                            try:
-                                candidate_tags = gen.generate_tags(file_bytes, filename=source_filename)
-                            except Exception as exc:
-                                raise ValueError(f"Tag generation failed: {exc}") from exc
                             if not candidate_tags:
                                 raise ValueError("Tag generation returned empty")
+                            new_alt = candidate_alt.strip()
                             new_tags = candidate_tags.strip()
+                        else:
+                            if regenerate_alt:
+                                try:
+                                    candidate_alt = gen._vision_message(
+                                        file_bytes, source_filename,
+                                        "Analyze this image and generate a concise, descriptive alt text for web accessibility. "
+                                        "Max 125 characters. Not starting with 'Image of'. Generate ONLY the alt text.",
+                                    ).strip()
+                                except Exception as exc:
+                                    raise ValueError(f"Alt text generation failed: {exc}") from exc
+                                if not candidate_alt:
+                                    raise ValueError("Alt text generation returned empty")
+                                new_alt = candidate_alt
+
+                            if regenerate_tags:
+                                try:
+                                    candidate_tags = gen.generate_tags(file_bytes, filename=source_filename)
+                                except Exception as exc:
+                                    raise ValueError(f"Tag generation failed: {exc}") from exc
+                                if not candidate_tags:
+                                    raise ValueError("Tag generation returned empty")
+                                new_tags = candidate_tags.strip()
 
                         patch: Dict = {}
                         if regenerate_alt and new_alt != current_alt:
@@ -4438,27 +3845,8 @@ def api_maintenance_retag_run():
 
         t = threading.Thread(target=worker, daemon=True)
         t.start()
-
-        while True:
-            try:
-                kind, value = q.get(timeout=1800)
-            except queue.Empty:
-                yield "data: [ERROR] Bulk re-tag timed out after 30 minutes\n\n"
-                break
-
-            if kind == "progress":
-                yield f"data: {value}\n\n"
-            elif kind == "done":
-                global _records_cache
-                _records_cache = None
-                yield f"data: [RESULT] {json.dumps(value, ensure_ascii=False)}\n\n"
-                yield "data: [DONE]\n\n"
-                break
-            elif kind == "error":
-                yield f"data: [ERROR] {value}\n\n"
-                break
-
-        t.join(timeout=5)
+        yield from _sse_poll_loop(t, q, 1800, "Bulk re-tag timed out after 30 minutes",
+                                  invalidate_cache=True)
 
     return Response(
         stream_with_context(generate()),
@@ -4938,6 +4326,12 @@ def api_maintenance_sync_highres():
                 processed = 0
                 failed = 0
                 total = len(candidates)
+                # Pre-load filenames once to avoid O(N) record_exists calls per slug
+                existing_filenames: set = {
+                    str(r.get("fields", {}).get("Filename", ""))
+                    for r in _records_snapshot(use_cache=True)
+                    if r.get("fields", {}).get("Filename")
+                }
                 for idx, item in enumerate(candidates, 1):
                     q.put(("progress", f"[{idx}/{total}] Cataloging {item['rel']}"))
                     try:
@@ -4954,6 +4348,7 @@ def api_maintenance_sync_highres():
                             source=item["source"],
                             write_high_res=False,
                             high_res_location_override=item["rel"],
+                            existing_filenames=existing_filenames,
                         )
                         processed += 1
                     except Exception as exc:
@@ -4976,27 +4371,8 @@ def api_maintenance_sync_highres():
 
         t = threading.Thread(target=worker, daemon=True)
         t.start()
-
-        while True:
-            try:
-                kind, value = q.get(timeout=600)
-            except queue.Empty:
-                yield "data: [ERROR] Maintenance sync timed out after 10 minutes\n\n"
-                break
-
-            if kind == "progress":
-                yield f"data: {value}\n\n"
-            elif kind == "done":
-                global _records_cache
-                _records_cache = None
-                yield f"data: [RESULT] {json.dumps(value, ensure_ascii=False)}\n\n"
-                yield "data: [DONE]\n\n"
-                break
-            elif kind == "error":
-                yield f"data: [ERROR] {value}\n\n"
-                break
-
-        t.join(timeout=5)
+        yield from _sse_poll_loop(t, q, 600, "Maintenance sync timed out after 10 minutes",
+                                  invalidate_cache=True)
 
     return Response(
         stream_with_context(generate()),
@@ -5028,25 +4404,7 @@ def api_maintenance_folder_ingest():
 
         t = threading.Thread(target=worker, daemon=True)
         t.start()
-
-        while True:
-            try:
-                kind, value = q.get(timeout=600)
-            except queue.Empty:
-                yield "data: [ERROR] Folder ingest timed out after 10 minutes\n\n"
-                break
-
-            if kind == "progress":
-                yield f"data: {value}\n\n"
-            elif kind == "done":
-                yield f"data: [RESULT] {json.dumps(value, ensure_ascii=False)}\n\n"
-                yield "data: [DONE]\n\n"
-                break
-            elif kind == "error":
-                yield f"data: [ERROR] {value}\n\n"
-                break
-
-        t.join(timeout=5)
+        yield from _sse_poll_loop(t, q, 600, "Folder ingest timed out after 10 minutes")
 
     return Response(
         stream_with_context(generate()),
@@ -5085,7 +4443,7 @@ def api_maintenance_health_snapshot():
     drift = _collect_drift_candidates(records, limit=50)
     orphans = _collect_orphan_snapshot(limit=25, records=records)
     broken = _collect_broken_thumbnail_snapshot(limit=25, records=records)
-    duplicates = _collect_duplicate_snapshot(limit=25, include_near_alt=True, near_threshold=0.92, records=records)
+    duplicates = _collect_duplicate_snapshot_helper(records, limit=25, include_near_alt=True, near_threshold=0.92)
 
     return jsonify({
         "generated_at": _now_utc_iso(),
@@ -5974,7 +5332,6 @@ def debug_config():
     })
 
 
-
 @app.route("/api/upload/stage", methods=["POST"])
 @login_required
 def api_upload_stage():
@@ -6084,28 +5441,8 @@ def api_upload_process():
 
         t = threading.Thread(target=worker, daemon=True)
         t.start()
-
-        while True:
-            try:
-                kind, value = q.get(timeout=180)
-            except queue.Empty:
-                yield "data: [ERROR] Processing timed out after 3 minutes\n\n"
-                break
-
-            if kind == "progress":
-                yield f"data: {value}\n\n"
-            elif kind == "done":
-                yield f"data: [RESULT] {json.dumps(value, ensure_ascii=False)}\n\n"
-                yield "data: [DONE]\n\n"
-                # Invalidate records cache so library reflects new image
-                global _records_cache
-                _records_cache = None
-                break
-            elif kind == "error":
-                yield f"data: [ERROR] {value}\n\n"
-                break
-
-        t.join(timeout=5)
+        yield from _sse_poll_loop(t, q, 180, "Processing timed out after 3 minutes",
+                                  invalidate_cache=True)
 
     return Response(
         stream_with_context(generate()),

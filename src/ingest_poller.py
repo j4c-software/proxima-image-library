@@ -166,6 +166,13 @@ def _run_once(on_progress: Optional[Callable[[str], None]] = None) -> Dict:
     deleted = 0
     total = len(new_files)
 
+    # Build slug filename set once to avoid O(N) record_exists calls per image
+    existing_filenames: set = {
+        str(r.get("fields", {}).get("Filename", ""))
+        for r in records
+        if r.get("fields", {}).get("Filename")
+    }
+
     for idx, (sp_path, _rel) in enumerate(new_files, 1):
         filename = PurePosixPath(sp_path).name
         progress(f"[{idx}/{total}] Processing {filename}")
@@ -183,11 +190,16 @@ def _run_once(on_progress: Optional[Callable[[str], None]] = None) -> Dict:
                 source="Internal",
                 initial_status="ingested",
                 ingest_source=filename,
+                existing_filenames=existing_filenames,
             )
 
             # Verify: confirm the WebP file exists in SharePoint
             verified = False
             location = str(result.get("location") or result.get("high_res_location") or "").strip()
+            if not location:
+                _emit("error", f"[ERROR] {filename}: process_image returned no location — source kept, record may be incomplete")
+                failed += 1
+                continue
             if location:
                 root = (Config.IMAGE_FOLDER or "").strip().strip("/")
                 webp_path = f"{root}/WebP/{location}" if root else f"WebP/{location}"

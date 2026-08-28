@@ -251,6 +251,161 @@ Rules:
             print(f"Error determining category for {filename or source}: {e}")
             return None
 
+    def generate_all(
+        self,
+        source: Union[str, bytes],
+        categories: list,
+        filename: str = "",
+        context: Optional[str] = None,
+        max_alt_length: int = 125,
+    ) -> tuple[Optional[str], Optional[str], Optional[str]]:
+        """Generate category, alt text, and tags in a single Claude API call.
+
+        Returns (category, alt_text, tags). Any field may be None on failure.
+        Encodes the image once and sends it once — ~3× faster than calling the
+        three methods individually.
+        """
+        try:
+            if isinstance(source, str):
+                if not Path(source).exists():
+                    return None, None, None
+                filename = filename or source
+
+            from src.tag_library import TagLibrary
+            allowed_tags = ", ".join(TagLibrary.instance().get_flat())
+            category_list = "\n".join(f"- {c}" for c in categories)
+
+            prompt = f"""Analyze this image and return exactly three labeled lines:
+
+CATEGORY: <choose the single best option from this list>
+{category_list}
+
+ALT: <concise descriptive alt text, max {max_alt_length} characters, suitable for screen readers, do not start with "Image of" or "Picture of">
+
+TAGS: <2-5 comma-separated tags chosen from the approved list below; if an important aspect has no good match you may suggest up to 2 new tags prefixed with '?' (e.g. ?rooftop-garden); suggested tags must be lowercase and hyphenated>
+Approved tags: {allowed_tags}
+"""
+            if context:
+                prompt += f"\nContext: {context}"
+            prompt += "\n\nReturn ONLY the three labeled lines (CATEGORY:, ALT:, TAGS:), nothing else."
+
+            image_data, media_type = self._encode(source, filename)
+            message = self.client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=300,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": media_type,
+                                "data": image_data,
+                            },
+                        },
+                        {"type": "text", "text": prompt},
+                    ],
+                }],
+            )
+            raw = message.content[0].text.strip()
+
+            category_out: Optional[str] = None
+            alt_out: Optional[str] = None
+            tags_out: Optional[str] = None
+
+            for line in raw.splitlines():
+                line = line.strip()
+                if line.upper().startswith("CATEGORY:"):
+                    val = line[len("CATEGORY:"):].strip()
+                    for cat in categories:
+                        if cat.lower() == val.lower():
+                            category_out = cat
+                            break
+                    if category_out is None:
+                        for cat in categories:
+                            if cat.lower() in val.lower():
+                                category_out = cat
+                                break
+                elif line.upper().startswith("ALT:"):
+                    alt_out = line[len("ALT:"):].strip()[:max_alt_length] or None
+                elif line.upper().startswith("TAGS:"):
+                    tags_out = line[len("TAGS:"):].strip() or None
+
+            return category_out, alt_out, tags_out
+
+        except Exception as e:
+            print(f"Error in generate_all for {filename or source}: {e}")
+            return None, None, None
+
+    def generate_alt_and_tags(
+        self,
+        source: Union[str, bytes],
+        filename: str = "",
+        context: Optional[str] = None,
+        max_alt_length: int = 125,
+    ) -> tuple[Optional[str], Optional[str]]:
+        """Generate alt text and tags in a single Claude API call (no category).
+
+        Returns (alt_text, tags). Used by the retag path where category is not needed.
+        """
+        try:
+            if isinstance(source, str):
+                if not Path(source).exists():
+                    return None, None
+                filename = filename or source
+
+            from src.tag_library import TagLibrary
+            allowed_tags = ", ".join(TagLibrary.instance().get_flat())
+
+            prompt = f"""Analyze this image and return exactly two labeled lines:
+
+ALT: <concise descriptive alt text, max {max_alt_length} characters, suitable for screen readers, do not start with "Image of" or "Picture of">
+
+TAGS: <2-5 comma-separated tags chosen from the approved list below; if an important aspect has no good match you may suggest up to 2 new tags prefixed with '?' (e.g. ?rooftop-garden); suggested tags must be lowercase and hyphenated>
+Approved tags: {allowed_tags}
+"""
+            if context:
+                prompt += f"\nContext: {context}"
+            prompt += "\n\nReturn ONLY the two labeled lines (ALT:, TAGS:), nothing else."
+
+            image_data, media_type = self._encode(source, filename)
+            message = self.client.messages.create(
+                model="claude-sonnet-4-6",
+                max_tokens=250,
+                messages=[{
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": media_type,
+                                "data": image_data,
+                            },
+                        },
+                        {"type": "text", "text": prompt},
+                    ],
+                }],
+            )
+            raw = message.content[0].text.strip()
+
+            alt_out: Optional[str] = None
+            tags_out: Optional[str] = None
+
+            for line in raw.splitlines():
+                line = line.strip()
+                if line.upper().startswith("ALT:"):
+                    alt_out = line[len("ALT:"):].strip()[:max_alt_length] or None
+                elif line.upper().startswith("TAGS:"):
+                    tags_out = line[len("TAGS:"):].strip() or None
+
+            return alt_out, tags_out
+
+        except Exception as e:
+            print(f"Error in generate_alt_and_tags for {filename or source}: {e}")
+            return None, None
+
     def batch_generate_alt_text(
         self,
         image_paths: list,
