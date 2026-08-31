@@ -149,11 +149,13 @@ Authoritative production mapping:
 
 | Public domain | Azure App Service | Normal deployment path |
 | --- | --- | --- |
-| `library.liveproxima.org` | `PP-MCP-Server` | Push to `main` |
+| `library.liveproxima.org` | `PP-App-Serv` | Push to `main` |
 
 Before calling a deployment successful, verify the public hostname resolves to the intended App Service. Do not infer the target from an App Service name, a previous workflow run, or an Azure "Running" status.
 
-`PP-App-Serv` is **not** the normal target for this image library. It can only be selected through a manual workflow dispatch for a corrective restore, and that restore must specify a full 40-character Git commit SHA. Never select it for `library.liveproxima.org` without separate authorization and hostname verification.
+`PP-MCP-Server` is **Pete's MCP service**, not the Image Library deployment target. It can only be restored through the `restore-pete-mcp` manual workflow operation and a full Azure Kudu deployment ID. Never deploy Image Library code to it.
+
+Azure's custom-domain tags identify `PP-App-Serv` as the Image Library host and `PP-MCP-Server` as the Pete MCP host. Public DNS currently conflicts with those Azure records: `library.liveproxima.org` resolves to `pp-mcp-server.azurewebsites.net`. Do not "solve" that conflict by changing a deployment target; stop and escalate it as a separate DNS decision.
 
 For every deployment, record the commit SHA, target App Service, GitHub Actions run URL, deployment outcome, and a live authenticated route check. If authenticated checking is unavailable, record the exact authorization blocker rather than claiming application-level verification.
 

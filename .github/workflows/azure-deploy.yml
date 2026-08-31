@@ -1,55 +1,41 @@
-name: Deploy to Azure App Service
+name: Deploy Image Library or Restore Pete MCP
 
 on:
   push:
     branches: [main]
   workflow_dispatch:
     inputs:
-      app_name:
-        description: App Service to deploy
+      operation:
+        description: Operation to run
         required: true
-        default: PP-MCP-Server
+        default: deploy-image-library
         type: choice
         options:
-          - PP-MCP-Server
-          - PP-App-Serv
-      source_ref:
-        description: Optional commit or ref to deploy (defaults to the triggering commit)
+          - deploy-image-library
+          - restore-pete-mcp
+      pete_deployment_id:
+        description: Required only for restore-pete-mcp; full Azure Kudu deployment ID
         required: false
         default: ""
         type: string
 
 concurrency:
-  group: azure-deploy-main
+  group: image-library-${{ inputs.operation || 'deploy-image-library' }}
   cancel-in-progress: true
 
 jobs:
-  deploy:
+  deploy-image-library:
+    if: github.event_name == 'push' || inputs.operation == 'deploy-image-library'
     runs-on: ubuntu-latest
     timeout-minutes: 15
 
     steps:
-      - name: Validate deployment target
-        env:
-          DEPLOY_TARGET: ${{ inputs.app_name || 'PP-MCP-Server' }}
-          RESTORE_REF: ${{ inputs.source_ref }}
-          TRIGGER: ${{ github.event_name }}
-        run: |
-          echo "Deploy target: ${DEPLOY_TARGET}"
-          if [ "${DEPLOY_TARGET}" = "PP-App-Serv" ]; then
-            test "${TRIGGER}" = "workflow_dispatch" || {
-              echo "PP-App-Serv may only be targeted by an explicit manual restore run." >&2
-              exit 1
-            }
-            printf '%s' "${RESTORE_REF}" | grep -Eq '^[0-9a-f]{40}$' || {
-              echo "PP-App-Serv restores require a full 40-character commit SHA." >&2
-              exit 1
-            }
-          fi
-
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ inputs.source_ref || github.sha }}
+
+      - name: Confirm authoritative target
+        run: |
+          echo "Image Library production target: PP-App-Serv"
+          echo "Do not deploy Image Library code to PP-MCP-Server."
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -65,9 +51,42 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Deploy to Azure Web App
+      - name: Deploy to Image Library App Service
         uses: azure/webapps-deploy@v3
         with:
-          # library.liveproxima.org is bound to PP-MCP-Server.
-          app-name: ${{ inputs.app_name || 'PP-MCP-Server' }}
+          app-name: PP-App-Serv
           startup-command: 'bash startup.sh'
+
+  restore-pete-mcp:
+    if: github.event_name == 'workflow_dispatch' && inputs.operation == 'restore-pete-mcp'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Validate Pete restore request
+        env:
+          PETE_DEPLOYMENT_ID: ${{ inputs.pete_deployment_id }}
+        run: |
+          printf '%s' "${PETE_DEPLOYMENT_ID}" | grep -Eq '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' || {
+            echo "A full Azure Kudu deployment ID is required to restore Pete MCP." >&2
+            exit 1
+          }
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Restore prior Pete MCP package
+        env:
+          PETE_DEPLOYMENT_ID: ${{ inputs.pete_deployment_id }}
+        run: |
+          set -euo pipefail
+          PUBLISHING_USER=$(az webapp deployment list-publishing-credentials --resource-group PP-Resources --name PP-MCP-Server --query publishingUserName -o tsv)
+          PUBLISHING_PASSWORD=$(az webapp deployment list-publishing-credentials --resource-group PP-Resources --name PP-MCP-Server --query publishingPassword -o tsv)
+          curl --fail-with-body --silent --show-error \
+            --user "${PUBLISHING_USER}:${PUBLISHING_PASSWORD}" \
+            --request PUT \
+            --header 'Content-Type: application/json' \
+            --data '{"clean":false,"needFileUpdate":true}' \
+            "https://pp-mcp-server.scm.azurewebsites.net/api/deployments/${PETE_DEPLOYMENT_ID}"
