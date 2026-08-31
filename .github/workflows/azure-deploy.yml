@@ -77,6 +77,13 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
+      - name: Temporarily enable Pete MCP SCM publishing authentication
+        run: |
+          set -euo pipefail
+          az rest --method PUT \
+            --uri "https://management.azure.com/subscriptions/9528fb58-4fa4-43f8-9940-e5c3e1f1903f/resourceGroups/PP-Resources/providers/Microsoft.Web/sites/PP-MCP-Server/basicPublishingCredentialsPolicies/scm?api-version=2022-09-01" \
+            --body '{"properties":{"allow":true}}'
+
       - name: Restore prior Pete MCP package
         env:
           PETE_DEPLOYMENT_ID: ${{ inputs.pete_deployment_id }}
@@ -90,3 +97,11 @@ jobs:
             --header 'Content-Type: application/json' \
             --data '{"clean":false,"needFileUpdate":true}' \
             "https://pp-mcp-server.scm.azurewebsites.net/api/deployments/${PETE_DEPLOYMENT_ID}"
+
+      - name: Disable Pete MCP SCM publishing authentication
+        if: always()
+        run: |
+          set -euo pipefail
+          az rest --method PUT \
+            --uri "https://management.azure.com/subscriptions/9528fb58-4fa4-43f8-9940-e5c3e1f1903f/resourceGroups/PP-Resources/providers/Microsoft.Web/sites/PP-MCP-Server/basicPublishingCredentialsPolicies/scm?api-version=2022-09-01" \
+            --body '{"properties":{"allow":false}}'
