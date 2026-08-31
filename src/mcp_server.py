@@ -79,6 +79,69 @@ def _webp_url(location: str) -> str:
     return f"http://localhost:5000/image?path={location}"
 
 
+def _delivery_url(area: str, location: str) -> str:
+    """Build a delivery URL for an exact stored asset tier."""
+    if not location:
+        return ""
+    from urllib.parse import quote
+    base_url = (Config.APP_BASE_URL or "http://localhost:5000").rstrip("/")
+    secret = Config.MCP_INTERNAL_SECRET
+    query = f"area={quote(area)}&path={quote(location)}"
+    if secret:
+        query += f"&key={quote(secret)}"
+    return f"{base_url}/api/mcp/asset?{query}"
+
+
+def _add_delivery_metadata(item: dict) -> dict:
+    """Add sidecar fields without changing legacy search-result fields."""
+    if "qualityTier" in item and "standard" in item:
+        metadata = {
+            key: item.get(key)
+            for key in ("original", "hero", "standard", "width", "height", "qualityTier", "focalPoint")
+        }
+    else:
+        from src.image_metadata import read_metadata
+        metadata = read_metadata(item.get("slug", "")) if item.get("slug") else {}
+    if not metadata:
+        enriched = dict(item)
+        enriched["backfillAvailable"] = True
+        enriched["backfillReason"] = "missing derivative metadata"
+        enriched["backfillTool"] = "backfill_image_derivatives"
+        return enriched
+    enriched = dict(item)
+    for key in ("original", "hero", "standard"):
+        value = metadata.get(key)
+        enriched[key] = dict(value) if isinstance(value, dict) else value
+    if isinstance(enriched.get("original"), dict):
+        location = enriched["original"].get("location", "")
+        enriched["original"]["url"] = _delivery_url("High-Res", location)
+    if isinstance(enriched.get("standard"), dict):
+        location = enriched["standard"].get("location", "")
+        enriched["standard"]["url"] = _delivery_url("WebP", location)
+    if isinstance(enriched.get("hero"), dict):
+        location = enriched["hero"].get("location", "")
+        enriched["hero"]["url"] = _delivery_url("Hero", location)
+    enriched["width"] = metadata.get("width")
+    enriched["height"] = metadata.get("height")
+    enriched["qualityTier"] = metadata.get("qualityTier")
+    enriched["focalPoint"] = metadata.get("focalPoint")
+    enriched["preferredHeroUrl"] = (
+        (enriched.get("hero") or {}).get("url")
+        or (enriched.get("standard") or {}).get("url")
+        or enriched.get("webp_url", "")
+    )
+    enriched["standardWebUrl"] = (
+        (enriched.get("standard") or {}).get("url") or enriched.get("webp_url", "")
+    )
+    enriched["backfillAvailable"] = bool(
+        enriched.get("qualityTier") == "hero-ready" and not enriched.get("hero")
+    )
+    if enriched["backfillAvailable"]:
+        enriched["backfillReason"] = "hero-ready original has no hero derivative"
+        enriched["backfillTool"] = "backfill_image_derivatives"
+    return enriched
+
+
 _THUMB_MAX_PX = 200  # max width or height for inline thumbnails
 
 
@@ -231,6 +294,22 @@ async def list_tools() -> list[types.Tool]:
                         "enum": ["ShutterStock", "AdobeStock", "Unsplash", "Pexels", "Pixabay", "Internal"],
                         "description": "Optional source/provenance for the High-Res folder.",
                     },
+                    "attribution": {
+                        "type": "string",
+                        "description": "Photographer/creator credit supplied by the provider.",
+                    },
+                    "license": {
+                        "type": "string",
+                        "description": "License name, terms, or entitlement reference when known.",
+                    },
+                    "source_url": {
+                        "type": "string",
+                        "description": "Provider page or source URL for provenance.",
+                    },
+                    "source_asset_id": {
+                        "type": "string",
+                        "description": "Provider asset identifier when available.",
+                    },
                 },
                 "required": ["download_url", "original_filename", "category"],
             },
@@ -269,6 +348,25 @@ async def list_tools() -> list[types.Tool]:
                     },
                 },
                 "required": ["location"],
+            },
+        ),
+        types.Tool(
+            name="backfill_image_derivatives",
+            description=(
+                "Backfill a specifically selected Proxima library image after search. "
+                "Never call automatically: show the found image and ask the user to explicitly confirm first. "
+                "Preserves the original and existing standard WebP, creates a missing 2560px hero when eligible, "
+                "and writes or merges delivery/focal metadata."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "slug": {
+                        "type": "string",
+                        "description": "Exact slug returned by search_image_library.",
+                    },
+                },
+                "required": ["slug"],
             },
         ),
         types.Tool(
@@ -316,6 +414,8 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[types.TextCont
         return await _get_selected_images(arguments)
     if name == "get_image_url":
         return await _get_image_url(arguments)
+    if name == "backfill_image_derivatives":
+        return await _backfill_image_derivatives(arguments)
     if name == "catalog_image_from_file":
         return await _catalog_image_from_file(arguments)
     return [types.TextContent(type="text", text=json.dumps({"error": f"Unknown tool: {name}"}))]
@@ -354,7 +454,7 @@ async def _search_image_library(args: dict) -> list[types.TextContent]:
             })
 
     scored.sort(key=lambda x: x["score"], reverse=True)
-    results = scored[:limit]
+    results = [_add_delivery_metadata(item) for item in scored[:limit]]
 
     if not results:
         return [types.TextContent(
@@ -446,6 +546,17 @@ async def _search_image_library(args: dict) -> list[types.TextContent]:
             f"tags: {item.get('tags','')[:60]} | "
             f"location: {item.get('location','')}"
         )
+        delivery = {
+            key: item.get(key)
+            for key in (
+                "original", "hero", "standard", "width", "height",
+                "qualityTier", "focalPoint", "preferredHeroUrl", "standardWebUrl",
+                "backfillAvailable", "backfillReason", "backfillTool",
+            )
+            if key in item
+        }
+        if delivery:
+            label += f" | delivery: {json.dumps(delivery, ensure_ascii=False)}"
         contents.append(types.TextContent(type="text", text=label))
         if idx in thumb_map:
             contents.append(thumb_map[idx][1])
@@ -850,6 +961,10 @@ async def _catalog_stock_image(args: dict) -> list[types.TextContent]:
     original_filename = args.get("original_filename", "image.jpg").strip()
     category = args.get("category", "")
     source = args.get("source", "").strip()
+    attribution = args.get("attribution", "").strip()
+    license_info = args.get("license", "").strip()
+    source_url = args.get("source_url", "").strip() or download_url
+    source_asset_id = args.get("source_asset_id", "").strip()
 
     if not download_url:
         return [types.TextContent(type="text", text=json.dumps({"error": "download_url is required"}, ensure_ascii=False))]
@@ -891,8 +1006,13 @@ async def _catalog_stock_image(args: dict) -> list[types.TextContent]:
             image_folder=Config.IMAGE_FOLDER,
             storage_mode=storage_mode,
             source=source or None,
+            attribution=attribution,
+            license_info=license_info,
+            source_url=source_url,
+            source_asset_id=source_asset_id,
         )
         result["webp_url"] = _webp_url(result.get("location", ""))
+        result = _add_delivery_metadata(result)
         return [types.TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False))]
     except Exception:
         return [types.TextContent(type="text", text=json.dumps({"error": "Cataloging failed"}, ensure_ascii=False))]
@@ -909,6 +1029,56 @@ async def _get_image_url(args: dict) -> list[types.TextContent]:
     base = "https://library.liveproxima.org"
     url = f"{base}/api/mcp/thumbnail?path={quote(location)}&key={quote(secret)}"
     return [types.TextContent(type="text", text=json.dumps({"url": url, "location": location}))]
+
+
+async def _backfill_image_derivatives(args: dict) -> list[types.TextContent]:
+    slug = str(args.get("slug", "") or "").strip()
+    if not slug:
+        return [types.TextContent(type="text", text=json.dumps({"error": "slug is required"}))]
+
+    list_client = _get_list_client()
+    record = next(
+        (
+            item for item in list_client.get_all_records()
+            if str(item.get("fields", {}).get("Slug", "") or "").strip() == slug
+        ),
+        None,
+    )
+    if not record:
+        return [types.TextContent(type="text", text=json.dumps({"error": "Image not found", "slug": slug}))]
+
+    if Config.STORAGE_MODE == "sharepoint":
+        from src.sharepoint_client import SharePointClient
+        sp_client = SharePointClient()
+        storage_mode = "sharepoint"
+    else:
+        sp_client = None
+        storage_mode = "local"
+    try:
+        from src.hero_backfill import backfill_record
+        result = backfill_record(
+            record,
+            storage_mode=storage_mode,
+            image_folder=Config.IMAGE_FOLDER,
+            sp_client=sp_client,
+        )
+        fields = record.get("fields", {})
+        delivery = _add_delivery_metadata({
+            "slug": slug,
+            "filename": fields.get("Filename", ""),
+            "location": fields.get("Location", ""),
+            "webp_url": _webp_url(fields.get("Location", "")),
+            "status": fields.get("Status", ""),
+        })
+        return [types.TextContent(
+            type="text",
+            text=json.dumps({"ok": True, **result, "delivery": delivery}, indent=2, ensure_ascii=False),
+        )]
+    except Exception as exc:
+        return [types.TextContent(type="text", text=json.dumps({
+            "error": str(exc) or "Backfill failed",
+            "slug": slug,
+        }, ensure_ascii=False))]
 
 
 async def _catalog_image_from_file(args: dict) -> list[types.TextContent]:
@@ -956,6 +1126,7 @@ async def _catalog_image_from_file(args: dict) -> list[types.TextContent]:
             source="Internal",
         )
         result["webp_url"] = _webp_url(result.get("location", ""))
+        result = _add_delivery_metadata(result)
         return [types.TextContent(type="text", text=json.dumps(result, indent=2, ensure_ascii=False))]
     except Exception:
         return [types.TextContent(type="text", text=json.dumps({"error": "Cataloging failed"}, ensure_ascii=False))]

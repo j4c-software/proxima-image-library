@@ -903,6 +903,8 @@ def api_catalog_stock():
                     category=category,
                     source_context=source_context or None,
                     source=source or None,
+                    attribution=photographer,
+                    source_url=download_url,
                 )
                 q.put(("done", result))
             except Exception:
@@ -934,6 +936,9 @@ def api_mcp_catalog_stock():
     title = data.get("title", "").strip()
     tags_raw = data.get("tags", "")
     photographer = data.get("photographer", "").strip()
+    license_info = data.get("license", "").strip()
+    source_url = data.get("source_url", "").strip() or download_url
+    source_asset_id = data.get("source_asset_id", "").strip()
 
     from src.image_processor import CATEGORIES, process_image
 
@@ -983,6 +988,10 @@ def api_mcp_catalog_stock():
             category=category,
             source_context=source_context or None,
             source=source or None,
+            attribution=photographer,
+            license_info=license_info,
+            source_url=source_url,
+            source_asset_id=source_asset_id,
         )
         return jsonify(result)
     except Exception:
@@ -1311,6 +1320,8 @@ def api_mcp_claude_article_auto():
                 category=category,
                 source_context=source_context or None,
                 source=candidate.get("library", ""),
+                attribution=candidate.get("photographer", ""),
+                source_url=download_url,
             )
             cataloged.append({
                 "phrase": candidate.get("phrase", ""),
@@ -1629,6 +1640,8 @@ def api_mcp_preview_select(token: str):
                 category=category,
                 source_context=source_context or None,
                 source=source or None,
+                attribution=photographer,
+                source_url=download_url,
             )
             cataloged.append({
                 "title": title or "Untitled",
@@ -1932,6 +1945,49 @@ def api_image_status():
     return jsonify({"error": "Record not found or update failed"}), 404
 
 
+@app.route("/api/image/focal-point", methods=["PATCH"])
+@login_required
+def api_image_focal_point():
+    """Let an authenticated editor revise normalized crop focal coordinates."""
+    data = request.get_json(force=True) or {}
+    record_id = str(data.get("id", "")).strip()
+    try:
+        x = float(data.get("x"))
+        y = float(data.get("y"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "x and y must be numbers between 0 and 1"}), 400
+    if not record_id:
+        return jsonify({"error": "id required"}), 400
+    if not 0 <= x <= 1 or not 0 <= y <= 1:
+        return jsonify({"error": "x and y must each be between 0 and 1"}), 400
+
+    record = next(
+        (item for item in get_all_records() if str(item.get("id", "")) == record_id),
+        None,
+    )
+    if not record:
+        return jsonify({"error": "Record not found"}), 404
+    slug = str(record.get("fields", {}).get("Slug", "")).strip()
+    if not slug:
+        return jsonify({"error": "Record has no slug"}), 409
+
+    from src.image_metadata import update_focal_point
+    try:
+        metadata = update_focal_point(
+            slug,
+            x,
+            y,
+            storage_mode=Config.STORAGE_MODE,
+            image_folder=Config.IMAGE_FOLDER,
+            sp_client=get_sp_client() if Config.STORAGE_MODE == "sharepoint" else None,
+        )
+    except FileNotFoundError:
+        return jsonify({"error": "Asset metadata has not been created; backfill requires approval"}), 409
+    except ValueError as exc:
+        return jsonify({"error": str(exc)}), 400
+    return jsonify({"ok": True, "slug": slug, "focalPoint": metadata["focalPoint"]})
+
+
 @app.route("/review")
 @login_required
 def review():
@@ -2133,6 +2189,50 @@ def api_mcp_thumbnail():
     return _serve_image(thumb=True)
 
 
+@app.route("/api/mcp/asset")
+def api_mcp_asset():
+    """Deliver an exact original, hero, or standard asset to MCP consumers."""
+    secret = Config.MCP_INTERNAL_SECRET
+    key = request.args.get("key", "")
+    if not secret or key != secret:
+        return Response("Unauthorized", status=401)
+
+    area = request.args.get("area", "")
+    if area not in {"High-Res", "Hero", "WebP"}:
+        return Response("Invalid asset area", status=400)
+    location = unquote(request.args.get("path", "")).strip()
+    if not location or PurePosixPath(location).is_absolute() or ".." in PurePosixPath(location).parts:
+        return Response("Invalid path", status=400)
+
+    if Config.STORAGE_MODE == "sharepoint":
+        try:
+            root = (Config.SHAREPOINT_IMAGE_FOLDER or "").strip().strip("/")
+            sp_path = f"{root}/{area}/{location}" if root else f"{area}/{location}"
+            return redirect(_get_sp_url(sp_path, thumb=False))
+        except Exception:
+            return Response("Internal server error", status=500)
+
+    image_root = Path(Config.IMAGE_FOLDER).resolve()
+    full_path = (image_root / area / location).resolve()
+    if not str(full_path).startswith(str(image_root)):
+        return Response("Forbidden", status=403)
+    if not full_path.is_file():
+        return Response("Image not found", status=404)
+    suffix = full_path.suffix.lower()
+    mimetype = {
+        ".webp": "image/webp",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".gif": "image/gif",
+    }.get(suffix, "application/octet-stream")
+    return Response(
+        full_path.read_bytes(),
+        mimetype=mimetype,
+        headers={"Cache-Control": "private, max-age=3600"},
+    )
+
+
 # ------------------------------------------------------------------
 # Tag library
 # ------------------------------------------------------------------
@@ -2158,6 +2258,154 @@ def maintenance():
     user = session.get("user", {})
     is_admin = _is_maintenance_admin_user(user)
     return render_template("maintenance.html", user=user, is_admin=is_admin)
+
+
+@app.route("/api/maintenance/hero-backfill/candidates")
+@login_required
+def api_maintenance_hero_backfill_candidates():
+    """Return itemized, read-only candidates for selective derivative backfill."""
+    status_filter = str(request.args.get("status", "approved") or "").strip().lower()
+    records = _records_snapshot(use_cache=False)
+    if status_filter:
+        records = [
+            record for record in records
+            if str(record.get("fields", {}).get("Status", "") or "").strip().lower()
+            == status_filter
+        ]
+
+    from src.catalog_inventory import build_inventory
+    if Config.STORAGE_MODE == "sharepoint":
+        storage_mode = "sharepoint"
+        sp_client = get_sp_client()
+    else:
+        storage_mode = "local"
+        sp_client = None
+    report = build_inventory(
+        records,
+        storage_mode=storage_mode,
+        image_folder=Config.IMAGE_FOLDER,
+        sp_client=sp_client,
+    )
+    candidates = []
+    for key in ("heroEligible", "standardOnly1601To2559", "storedOriginalOnly1600", "below1600"):
+        for item in report[key]:
+            if item.get("backfillNeeded"):
+                candidates.append(item)
+    candidates.sort(
+        key=lambda item: (
+            0 if int(item.get("width", 0) or 0) >= 2560 else 1,
+            str(item.get("filename", "") or "").lower(),
+        )
+    )
+    return jsonify({
+        "dryRun": True,
+        "statusFilter": status_filter,
+        "scannedCount": len(records),
+        "candidateCount": len(candidates),
+        "heroEligibleCount": sum(1 for item in candidates if item.get("width", 0) >= 2560),
+        "candidates": candidates,
+    })
+
+
+@app.route("/api/maintenance/hero-backfill/run", methods=["POST"])
+@login_required
+def api_maintenance_hero_backfill_run():
+    """Stream progress while backfilling only explicitly selected record IDs."""
+    data = request.get_json(force=True) or {}
+    raw_ids = data.get("record_ids", [])
+    if not isinstance(raw_ids, list):
+        return jsonify({"error": "record_ids must be an array"}), 400
+    record_ids = list(dict.fromkeys(str(value or "").strip() for value in raw_ids if str(value or "").strip()))
+    try:
+        expected_count = int(data.get("expected_count"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "expected_count is required"}), 400
+    if not record_ids:
+        return jsonify({"error": "Select at least one record"}), 400
+    if expected_count != len(record_ids):
+        return jsonify({"error": "expected_count does not match selected records"}), 409
+    max_batch = int(_maintenance_guardrails().get("max_batch_size", 500) or 500)
+    if len(record_ids) > max_batch:
+        return jsonify({"error": f"Selection exceeds max batch size of {max_batch}"}), 400
+
+    record_map = {
+        str(record.get("id", "")).strip(): record
+        for record in _records_snapshot(use_cache=False)
+    }
+    missing_ids = [record_id for record_id in record_ids if record_id not in record_map]
+    if missing_ids:
+        return jsonify({"error": "One or more selected records no longer exist", "missing_ids": missing_ids}), 409
+    targets = [record_map[record_id] for record_id in record_ids]
+
+    def generate():
+        from src.hero_backfill import backfill_record
+
+        if Config.STORAGE_MODE == "sharepoint":
+            storage_mode = "sharepoint"
+            sp_client = get_sp_client()
+        else:
+            storage_mode = "local"
+            sp_client = None
+        total = len(targets)
+        succeeded = 0
+        failed = 0
+        hero_created = 0
+        yield f"data: {json.dumps({'type': 'start', 'total': total, 'processed': 0, 'succeeded': 0, 'failed': 0})}\n\n"
+
+        for index, record in enumerate(targets, 1):
+            fields = record.get("fields", {})
+            filename = str(fields.get("Filename", "") or record.get("id", ""))
+            try:
+                result = backfill_record(
+                    record,
+                    storage_mode=storage_mode,
+                    image_folder=Config.IMAGE_FOLDER,
+                    sp_client=sp_client,
+                )
+                succeeded += 1
+                hero_created += int(bool(result.get("heroCreated")))
+                event = {
+                    "type": "progress",
+                    "status": "succeeded",
+                    "processed": index,
+                    "total": total,
+                    "succeeded": succeeded,
+                    "failed": failed,
+                    "heroCreated": hero_created,
+                    "filename": filename,
+                    "result": result,
+                }
+            except Exception as exc:
+                failed += 1
+                event = {
+                    "type": "progress",
+                    "status": "failed",
+                    "processed": index,
+                    "total": total,
+                    "succeeded": succeeded,
+                    "failed": failed,
+                    "heroCreated": hero_created,
+                    "filename": filename,
+                    "error": str(exc) or "Backfill failed",
+                }
+            yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+
+        result = {
+            "type": "done",
+            "processed": total,
+            "total": total,
+            "succeeded": succeeded,
+            "failed": failed,
+            "heroCreated": hero_created,
+        }
+        _maintenance_append_audit("selective-hero-backfill", "ok" if failed == 0 else "partial", result)
+        yield f"data: {json.dumps(result)}\n\n"
+
+    return Response(
+        stream_with_context(generate()),
+        mimetype="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
 
 
 

@@ -9,12 +9,17 @@ from pathlib import Path, PurePosixPath
 from typing import Callable, Optional
 
 from PIL import Image as PILImage
+from PIL import ImageCms, ImageOps
 
 from src.config import Config
 
-# Matches specification.md — WebP output spec
-WEBP_MAX_SIDE = 1600
-WEBP_QUALITY = 80
+# Approved website derivatives. Width is authoritative; height follows the
+# EXIF-corrected source aspect ratio. Existing callers of transform_to_webp()
+# continue to receive the standard derivative.
+HERO_WIDTH = 2560
+STANDARD_WIDTH = 1600
+WEBP_MAX_SIDE = STANDARD_WIDTH  # backward-compatible import
+WEBP_QUALITY = 82
 
 CATEGORIES = ["Headshots", "Community", "Locations", "Situations", "Graphics", "Banners"]
 SOURCES = ["ShutterStock", "AdobeStock", "Unsplash", "Pexels", "Pixabay", "Internal"]
@@ -46,30 +51,93 @@ def normalize_source(source: Optional[str]) -> str:
 # Image transformation
 # ---------------------------------------------------------------------------
 
-def transform_to_webp(image_bytes: bytes) -> bytes:
-    """Convert raw image bytes to WebP.
+def classify_quality(width: int) -> str:
+    """Classify an EXIF-corrected original by its usable pixel width."""
+    if width >= HERO_WIDTH:
+        return "hero-ready"
+    if width >= STANDARD_WIDTH:
+        return "standard-only"
+    return "low-resolution"
 
-    Scales down if the longest side exceeds WEBP_MAX_SIDE (never upscales).
-    Preserves alpha channel for PNG/WebP sources.
+
+def _to_srgb(img: PILImage.Image) -> PILImage.Image:
+    """Convert pixels to sRGB while retaining an alpha channel when present."""
+    has_alpha = img.mode in ("RGBA", "LA") or (
+        img.mode == "P" and "transparency" in img.info
+    )
+    rgba = img.convert("RGBA") if has_alpha else None
+    rgb = rgba.convert("RGB") if rgba is not None else img.convert("RGB")
+    icc_profile = img.info.get("icc_profile")
+    if icc_profile:
+        try:
+            rgb = ImageCms.profileToProfile(
+                rgb,
+                ImageCms.ImageCmsProfile(BytesIO(icc_profile)),
+                ImageCms.createProfile("sRGB"),
+                outputMode="RGB",
+            )
+        except (ImageCms.PyCMSError, OSError, ValueError):
+            # Malformed/unsupported embedded profiles should not prevent safe
+            # RGB normalization through Pillow's regular conversion.
+            rgb = img.convert("RGB")
+    if rgba is not None:
+        rgb.putalpha(rgba.getchannel("A"))
+    return rgb
+
+
+def inspect_original(image_bytes: bytes) -> dict:
+    """Return immutable-source facts using display orientation for dimensions."""
+    with PILImage.open(BytesIO(image_bytes)) as source_img:
+        source_format = (source_img.format or "unknown").upper()
+        oriented = ImageOps.exif_transpose(source_img)
+        width, height = oriented.size
+        return {
+            "width": width,
+            "height": height,
+            "format": source_format,
+            "fileSize": len(image_bytes),
+            "qualityTier": classify_quality(width),
+        }
+
+
+def _encode_webp(img: PILImage.Image, target_width: int) -> dict:
+    width, height = img.size
+    output_width = min(target_width, width)  # explicit no-upscale guarantee
+    output_height = round(height * output_width / width)
+    if (output_width, output_height) != img.size:
+        img = img.resize((output_width, output_height), PILImage.Resampling.LANCZOS)
+    buf = BytesIO()
+    img.save(buf, format="WEBP", quality=WEBP_QUALITY, method=4)
+    content = buf.getvalue()
+    return {
+        "bytes": content,
+        "width": output_width,
+        "height": output_height,
+        "format": "WEBP",
+        "fileSize": len(content),
+        "quality": WEBP_QUALITY,
+    }
+
+
+def generate_web_derivatives(image_bytes: bytes) -> dict:
+    """Generate standard and, when eligible, hero derivatives without upscaling.
+
+    A sub-1600 source still receives a same-width WebP in the legacy standard
+    location so existing consumers continue to have a web-safe URL; its
+    low-resolution classification makes clear that it is not a 1600px asset.
     """
-    with PILImage.open(BytesIO(image_bytes)) as img:
-        # Preserve alpha where present; otherwise force RGB
-        if img.mode in ("RGBA", "LA"):
-            img = img.convert("RGBA")
-        elif img.mode == "P" and "transparency" in img.info:
-            img = img.convert("RGBA")
-        else:
-            img = img.convert("RGB")
+    original = inspect_original(image_bytes)
+    with PILImage.open(BytesIO(image_bytes)) as source_img:
+        oriented = ImageOps.exif_transpose(source_img)
+        srgb = _to_srgb(oriented)
+        standard = _encode_webp(srgb, STANDARD_WIDTH)
+        hero = _encode_webp(srgb, HERO_WIDTH) if original["width"] >= HERO_WIDTH else None
+    return {"original": original, "standard": standard, "hero": hero}
 
-        w, h = img.size
-        longest = max(w, h)
-        if longest > WEBP_MAX_SIDE:
-            scale = WEBP_MAX_SIDE / longest
-            img = img.resize((round(w * scale), round(h * scale)), PILImage.LANCZOS)
 
-        buf = BytesIO()
-        img.save(buf, format="WEBP", quality=WEBP_QUALITY, method=4)
-        return buf.getvalue()
+def transform_to_webp(image_bytes: bytes) -> bytes:
+    """Backward-compatible standard WebP transform (quality 82, no upscale)."""
+    return generate_web_derivatives(image_bytes)["standard"]["bytes"]
 
 
 # ---------------------------------------------------------------------------
@@ -151,16 +219,21 @@ def process_image(
     initial_status: str = "pending-review",
     ingest_source: str = "",
     existing_filenames: Optional[set] = None,
+    attribution: str = "",
+    license_info: str = "",
+    source_url: str = "",
+    source_asset_id: str = "",
+    focal_point: Optional[dict] = None,
 ) -> dict:
     """Full pipeline for a single image.
 
     Steps:
-      1. Transform source bytes → WebP (resize to spec, quality 80)
+      1. Inspect the untouched original and generate approved WebP derivatives
       2. Generate alt text via Claude vision (max 125 chars)
       3. Generate tags via Claude vision (2–5 from approved vocabulary)
       4. Build unique slug from alt text
-      5. Upload/save High-Res original and WebP output
-      6. Create metadata record in list store
+      5. Upload/save High-Res original, standard WebP, and optional hero WebP
+      6. Create the legacy metadata record and additive JSON sidecar
 
     Args:
         file_bytes:        Raw bytes of the source image.
@@ -185,14 +258,23 @@ def process_image(
 
     ext = Path(original_filename).suffix.lower() or ".jpg"
     source_name = normalize_source(source)
+    focal = focal_point or {"x": 0.5, "y": 0.5}
+    try:
+        focal = {"x": float(focal["x"]), "y": float(focal["y"])}
+    except (KeyError, TypeError, ValueError):
+        raise ValueError("focal_point must contain numeric x and y values")
+    if not 0 <= focal["x"] <= 1 or not 0 <= focal["y"] <= 1:
+        raise ValueError("focal_point x and y must each be between 0 and 1")
 
     def _log(msg: str) -> None:
         if on_progress:
             on_progress(msg)
 
-    # ── Step 1: Transform ──────────────────────────────────────────────────
-    _log("Transforming image to WebP…")
-    webp_bytes = transform_to_webp(file_bytes)
+    # ── Step 1: Inspect + transform ────────────────────────────────────────
+    _log("Inspecting original and generating approved WebP derivatives…")
+    derivatives = generate_web_derivatives(file_bytes)
+    webp_bytes = derivatives["standard"]["bytes"]
+    hero_bytes = derivatives["hero"]["bytes"] if derivatives["hero"] else None
     image_hash = compute_perceptual_hash(webp_bytes)
 
     # ── Steps 1b–3: Category + alt text + tags in one Claude call ─────────
@@ -219,6 +301,7 @@ def process_image(
     webp_filename = f"{slug}.webp"
     highres_filename = f"{slug}-original{ext}"
     location = f"{category}/{webp_filename}"
+    hero_location = f"{category}/{webp_filename}" if hero_bytes is not None else ""
     high_res_location = high_res_location_override or f"{source_name}/{highres_filename}"
 
     # ── Steps 5a–5b: Store files ───────────────────────────────────────────
@@ -231,6 +314,9 @@ def process_image(
             sp_client.upload_file(hr_folder, hr_rel.name, file_bytes)
         _log("Uploading WebP to SharePoint…")
         sp_client.upload_file(f"{root}/WebP/{category}", webp_filename, webp_bytes)
+        if hero_bytes is not None:
+            _log("Uploading hero WebP to SharePoint…")
+            sp_client.upload_file(f"{root}/Hero/{category}", webp_filename, hero_bytes)
     else:
         base = Path(image_folder)
         _log("Saving files locally…")
@@ -238,6 +324,11 @@ def process_image(
         webp_path = base / "WebP" / category / webp_filename
         webp_path.parent.mkdir(parents=True, exist_ok=True)
         webp_path.write_bytes(webp_bytes)
+
+        if hero_bytes is not None:
+            hero_path = base / "Hero" / category / webp_filename
+            hero_path.parent.mkdir(parents=True, exist_ok=True)
+            hero_path.write_bytes(hero_bytes)
 
         if write_high_res:
             hr_path = base / "High-Res" / Path(high_res_location)
@@ -261,6 +352,46 @@ def process_image(
     if not record:
         raise RuntimeError("Metadata record creation failed")
 
+    original_meta = {
+        **derivatives["original"],
+        "filename": original_filename,
+        "location": high_res_location,
+        "provider": source_name,
+        "attribution": attribution,
+        "license": license_info,
+        "sourceUrl": source_url,
+        "assetId": source_asset_id,
+    }
+    standard_meta = {
+        key: value for key, value in derivatives["standard"].items() if key != "bytes"
+    }
+    standard_meta["location"] = location
+    hero_meta = None
+    if derivatives["hero"]:
+        hero_meta = {
+            key: value for key, value in derivatives["hero"].items() if key != "bytes"
+        }
+        hero_meta["location"] = hero_location
+
+    metadata = {
+        "schemaVersion": 1,
+        "slug": slug,
+        "original": original_meta,
+        "hero": hero_meta,
+        "standard": standard_meta,
+        "width": original_meta["width"],
+        "height": original_meta["height"],
+        "qualityTier": original_meta["qualityTier"],
+        "focalPoint": focal,
+    }
+    from src.image_metadata import write_metadata
+    metadata_location = write_metadata(
+        metadata,
+        storage_mode=storage_mode,
+        image_folder=image_folder,
+        sp_client=sp_client,
+    )
+
     _log("Done.")
     return {
         "slug": slug,
@@ -272,4 +403,12 @@ def process_image(
         "source": source_name,
         "status": initial_status,
         "image_hash": image_hash,
+        "original": original_meta,
+        "hero": hero_meta,
+        "standard": standard_meta,
+        "width": original_meta["width"],
+        "height": original_meta["height"],
+        "qualityTier": original_meta["qualityTier"],
+        "focalPoint": focal,
+        "metadata_location": metadata_location,
     }

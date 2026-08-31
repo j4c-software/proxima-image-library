@@ -226,6 +226,35 @@
       background: #fafafa;
       font-size: 12px;
     }
+    .backfill-counter-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+      gap: 8px;
+      margin: 10px 0 14px;
+    }
+    .backfill-counter {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: #f8fafc;
+      padding: 9px 10px;
+    }
+    .backfill-counter-label { color: var(--muted); font-size: 11px; }
+    .backfill-counter-value { font-size: 18px; font-weight: 700; margin-top: 2px; }
+    .backfill-table-wrap {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      overflow: auto;
+      max-height: 460px;
+    }
+    .backfill-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    .backfill-table th {
+      position: sticky; top: 0; z-index: 1;
+      background: #f8fafc; text-align: left; color: var(--muted);
+      padding: 8px; border-bottom: 1px solid var(--border);
+    }
+    .backfill-table td { padding: 8px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+    .backfill-thumb { width: 64px; height: 42px; object-fit: cover; border-radius: 5px; background: #e5e7eb; }
+    .backfill-tier { white-space: nowrap; font-weight: 600; }
     .purge-preview,
     .purge-result {
       border: 1px solid var(--border);
@@ -897,6 +926,51 @@
       </div>
     </section>
 
+    <section class="panel tool-panel" data-workstream="tools" data-title="Selective Hero Backfill">
+      <h1>Selective Hero Backfill</h1>
+      <p class="sub">
+        Scan existing records, select only the photos you want, then backfill missing hero derivatives and delivery metadata. Existing originals and standard WebP files are preserved.
+      </p>
+
+      <div class="controls">
+        <label for="backfill-status">Status</label>
+        <select id="backfill-status">
+          <option value="approved" selected>approved</option>
+          <option value="pending-review">pending-review</option>
+          <option value="ingested">ingested</option>
+          <option value="">all statuses</option>
+        </select>
+        <label for="backfill-tier">Quality tier</label>
+        <select id="backfill-tier">
+          <option value="hero-ready" selected>hero-ready</option>
+          <option value="standard-only">standard-only</option>
+          <option value="low-resolution">low-resolution</option>
+          <option value="">all tiers</option>
+        </select>
+        <button id="backfill-scan-btn" class="btn">Scan Candidates</button>
+      </div>
+
+      <div id="backfill-activity" class="purge-preview" aria-live="polite">
+        Ready. Scan candidates to begin.
+      </div>
+      <div class="backfill-counter-grid" aria-label="Backfill activity counters">
+        <div class="backfill-counter"><div class="backfill-counter-label">Elapsed</div><div id="backfill-count-elapsed" class="backfill-counter-value">0s</div></div>
+        <div class="backfill-counter"><div class="backfill-counter-label">Candidates</div><div id="backfill-count-candidates" class="backfill-counter-value">0</div></div>
+        <div class="backfill-counter"><div class="backfill-counter-label">Selected</div><div id="backfill-count-selected" class="backfill-counter-value">0</div></div>
+        <div class="backfill-counter"><div class="backfill-counter-label">Processed</div><div id="backfill-count-processed" class="backfill-counter-value">0 / 0</div></div>
+        <div class="backfill-counter"><div class="backfill-counter-label">Succeeded</div><div id="backfill-count-succeeded" class="backfill-counter-value">0</div></div>
+        <div class="backfill-counter"><div class="backfill-counter-label">Failed</div><div id="backfill-count-failed" class="backfill-counter-value">0</div></div>
+      </div>
+
+      <div class="controls">
+        <button id="backfill-select-visible-btn" class="btn btn-secondary" type="button" disabled>Select Visible</button>
+        <button id="backfill-clear-btn" class="btn btn-secondary" type="button" disabled>Clear Selection</button>
+        <button id="backfill-submit-btn" class="btn btn-fix" type="button" disabled>Backfill Selected</button>
+      </div>
+      <div id="backfill-table-wrap" class="backfill-table-wrap" style="display:none;"></div>
+      <div id="backfill-log" class="log" style="min-height:100px;max-height:220px;margin-top:12px;">No backfill activity yet.</div>
+    </section>
+
     <section class="panel tool-panel" data-workstream="tools" data-title="Record Purge by Status">
       <div class="tool-risk tool-risk-high">Danger Zone</div>
       <h1>Record Purge by Status</h1>
@@ -1543,6 +1617,27 @@
     const ingestSummaryEl = document.getElementById('ingest-summary');
     const ingestSummaryGridEl = document.getElementById('ingest-summary-grid');
     const ingestFileListEl = document.getElementById('ingest-file-list');
+
+    const backfillStatusSelect = document.getElementById('backfill-status');
+    const backfillTierSelect = document.getElementById('backfill-tier');
+    const backfillScanBtn = document.getElementById('backfill-scan-btn');
+    const backfillSelectVisibleBtn = document.getElementById('backfill-select-visible-btn');
+    const backfillClearBtn = document.getElementById('backfill-clear-btn');
+    const backfillSubmitBtn = document.getElementById('backfill-submit-btn');
+    const backfillActivityEl = document.getElementById('backfill-activity');
+    const backfillTableWrap = document.getElementById('backfill-table-wrap');
+    const backfillLogEl = document.getElementById('backfill-log');
+    const backfillCountElapsed = document.getElementById('backfill-count-elapsed');
+    const backfillCountCandidates = document.getElementById('backfill-count-candidates');
+    const backfillCountSelected = document.getElementById('backfill-count-selected');
+    const backfillCountProcessed = document.getElementById('backfill-count-processed');
+    const backfillCountSucceeded = document.getElementById('backfill-count-succeeded');
+    const backfillCountFailed = document.getElementById('backfill-count-failed');
+    let backfillCandidates = [];
+    let backfillSelectedIds = new Set();
+    let backfillTimer = null;
+    let backfillStartedAt = 0;
+    let backfillRunning = false;
 
     const purgeStatusSelect = document.getElementById('purge-status');
     const purgeDeleteFilesInput = document.getElementById('purge-delete-files');
@@ -2991,6 +3086,203 @@
     if (refreshMetricsBtn) {
       refreshMetricsBtn.addEventListener('click', refreshHubMetrics);
     }
+
+    function backfillEscape(value) {
+      return String(value ?? '')
+        .replaceAll('&', '&amp;')
+        .replaceAll('<', '&lt;')
+        .replaceAll('>', '&gt;')
+        .replaceAll('"', '&quot;')
+        .replaceAll("'", '&#039;');
+    }
+
+    function backfillVisibleCandidates() {
+      const tier = backfillTierSelect.value;
+      return backfillCandidates.filter((item) => !tier || item.qualityTier === tier);
+    }
+
+    function updateBackfillSelectionUi() {
+      const selectedCount = backfillSelectedIds.size;
+      backfillCountSelected.textContent = String(selectedCount);
+      backfillSubmitBtn.disabled = backfillRunning || selectedCount === 0;
+      backfillClearBtn.disabled = backfillRunning || selectedCount === 0;
+      backfillSelectVisibleBtn.disabled = backfillRunning || backfillVisibleCandidates().length === 0;
+    }
+
+    function startBackfillTimer() {
+      if (backfillTimer) clearInterval(backfillTimer);
+      backfillStartedAt = Date.now();
+      backfillCountElapsed.textContent = '0s';
+      backfillTimer = setInterval(() => {
+        const elapsed = Math.max(0, Math.floor((Date.now() - backfillStartedAt) / 1000));
+        backfillCountElapsed.textContent = `${elapsed}s`;
+      }, 1000);
+    }
+
+    function stopBackfillTimer() {
+      if (backfillTimer) clearInterval(backfillTimer);
+      backfillTimer = null;
+    }
+
+    function appendBackfillLog(message, cls = '') {
+      if (backfillLogEl.textContent === 'No backfill activity yet.') backfillLogEl.innerHTML = '';
+      const line = document.createElement('div');
+      line.textContent = message;
+      if (cls) line.className = cls;
+      backfillLogEl.appendChild(line);
+      backfillLogEl.scrollTop = backfillLogEl.scrollHeight;
+    }
+
+    function renderBackfillCandidates() {
+      const rows = backfillVisibleCandidates();
+      if (!rows.length) {
+        backfillTableWrap.style.display = '';
+        backfillTableWrap.innerHTML = '<div style="padding:14px;color:var(--muted);">No candidates match this quality tier.</div>';
+        updateBackfillSelectionUi();
+        return;
+      }
+      backfillTableWrap.style.display = '';
+      backfillTableWrap.innerHTML = `<table class="backfill-table">
+        <thead><tr><th>Select</th><th>Preview</th><th>Image</th><th>Original</th><th>Tier</th><th>Backfill</th></tr></thead>
+        <tbody>${rows.map((item) => {
+          const checked = backfillSelectedIds.has(String(item.id)) ? ' checked' : '';
+          const preview = `/thumbnail?path=${encodeURIComponent(item.location || '')}`;
+          const action = item.width >= 2560 ? 'Hero + metadata' : 'Metadata only';
+          return `<tr>
+            <td><input class="backfill-row-check" type="checkbox" data-record-id="${backfillEscape(item.id)}"${checked} aria-label="Select ${backfillEscape(item.filename)}" /></td>
+            <td><img class="backfill-thumb" src="${preview}" alt="" loading="lazy" /></td>
+            <td><strong>${backfillEscape(item.filename)}</strong><br><span style="color:var(--muted);">${backfillEscape(item.source || '')}</span></td>
+            <td>${Number(item.width || 0).toLocaleString()} × ${Number(item.height || 0).toLocaleString()}</td>
+            <td class="backfill-tier">${backfillEscape(item.qualityTier || '')}</td>
+            <td>${action}</td>
+          </tr>`;
+        }).join('')}</tbody>
+      </table>`;
+      backfillTableWrap.querySelectorAll('.backfill-row-check').forEach((checkbox) => {
+        checkbox.addEventListener('change', () => {
+          const recordId = checkbox.dataset.recordId || '';
+          if (checkbox.checked) backfillSelectedIds.add(recordId);
+          else backfillSelectedIds.delete(recordId);
+          updateBackfillSelectionUi();
+        });
+      });
+      updateBackfillSelectionUi();
+    }
+
+    backfillTierSelect.addEventListener('change', renderBackfillCandidates);
+
+    backfillScanBtn.addEventListener('click', async () => {
+      if (backfillRunning) return;
+      backfillScanBtn.disabled = true;
+      backfillSelectedIds.clear();
+      backfillCandidates = [];
+      backfillCountCandidates.textContent = '0';
+      backfillCountProcessed.textContent = '0 / 0';
+      backfillCountSucceeded.textContent = '0';
+      backfillCountFailed.textContent = '0';
+      backfillActivityEl.textContent = 'Scanning originals and metadata…';
+      backfillTableWrap.style.display = 'none';
+      backfillLogEl.innerHTML = '';
+      appendBackfillLog('Candidate scan started. Elapsed counter will continue until the scan responds.');
+      startBackfillTimer();
+      try {
+        const params = new URLSearchParams({ status: backfillStatusSelect.value });
+        const response = await fetch(`/api/maintenance/hero-backfill/candidates?${params.toString()}`);
+        const data = await response.json();
+        if (!response.ok) throw new Error(data.error || 'Candidate scan failed');
+        backfillCandidates = Array.isArray(data.candidates) ? data.candidates : [];
+        backfillCountCandidates.textContent = String(backfillCandidates.length);
+        backfillActivityEl.textContent = `Scan complete: ${data.candidateCount} candidate(s), ${data.heroEligibleCount} hero-ready.`;
+        appendBackfillLog(`Scanned ${data.scannedCount} record(s); found ${data.candidateCount} candidate(s).`, 'line-ok');
+        renderBackfillCandidates();
+      } catch (error) {
+        backfillActivityEl.textContent = error.message || 'Candidate scan failed.';
+        appendBackfillLog(error.message || 'Candidate scan failed.', 'line-err');
+      } finally {
+        stopBackfillTimer();
+        backfillScanBtn.disabled = false;
+        updateBackfillSelectionUi();
+      }
+    });
+
+    backfillSelectVisibleBtn.addEventListener('click', () => {
+      backfillVisibleCandidates().forEach((item) => backfillSelectedIds.add(String(item.id)));
+      renderBackfillCandidates();
+    });
+
+    backfillClearBtn.addEventListener('click', () => {
+      backfillSelectedIds.clear();
+      renderBackfillCandidates();
+    });
+
+    async function handleBackfillEvent(event) {
+      const processed = Number(event.processed || 0);
+      const total = Number(event.total || backfillSelectedIds.size || 0);
+      backfillCountProcessed.textContent = `${processed} / ${total}`;
+      backfillCountSucceeded.textContent = String(event.succeeded || 0);
+      backfillCountFailed.textContent = String(event.failed || 0);
+      if (event.type === 'start') {
+        backfillActivityEl.textContent = `Backfill running: 0 of ${total} processed…`;
+      } else if (event.type === 'progress') {
+        backfillActivityEl.textContent = `Backfill running: ${processed} of ${total} processed…`;
+        const cls = event.status === 'failed' ? 'line-err' : 'line-ok';
+        const detail = event.status === 'failed' ? event.error : (event.result?.heroCreated ? 'hero + metadata' : 'metadata');
+        appendBackfillLog(`[${processed}/${total}] ${event.filename}: ${detail}`, cls);
+      } else if (event.type === 'done') {
+        backfillActivityEl.textContent = `Backfill complete: ${event.succeeded} succeeded, ${event.failed} failed, ${event.heroCreated} hero derivative(s) created.`;
+        appendBackfillLog(backfillActivityEl.textContent, event.failed ? 'line-warn' : 'line-ok');
+      }
+    }
+
+    backfillSubmitBtn.addEventListener('click', async () => {
+      const recordIds = Array.from(backfillSelectedIds);
+      if (!recordIds.length || backfillRunning) return;
+      if (!window.confirm(`Backfill the ${recordIds.length} selected image(s)? Existing originals and standard WebP files will be preserved.`)) return;
+
+      backfillRunning = true;
+      backfillScanBtn.disabled = true;
+      backfillCountProcessed.textContent = `0 / ${recordIds.length}`;
+      backfillCountSucceeded.textContent = '0';
+      backfillCountFailed.textContent = '0';
+      updateBackfillSelectionUi();
+      startBackfillTimer();
+      appendBackfillLog(`Submitted ${recordIds.length} selected image(s).`);
+      try {
+        const response = await fetch('/api/maintenance/hero-backfill/run', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ record_ids: recordIds, expected_count: recordIds.length }),
+        });
+        if (!response.ok) {
+          const data = await response.json();
+          throw new Error(data.error || 'Backfill request failed');
+        }
+        if (!response.body) throw new Error('Streaming response is unavailable');
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        while (true) {
+          const { value, done } = await reader.read();
+          buffer += decoder.decode(value || new Uint8Array(), { stream: !done });
+          const chunks = buffer.split('\n\n');
+          buffer = chunks.pop() || '';
+          for (const chunk of chunks) {
+            const dataLine = chunk.split('\n').find((line) => line.startsWith('data: '));
+            if (!dataLine) continue;
+            await handleBackfillEvent(JSON.parse(dataLine.slice(6)));
+          }
+          if (done) break;
+        }
+      } catch (error) {
+        backfillActivityEl.textContent = error.message || 'Backfill failed.';
+        appendBackfillLog(error.message || 'Backfill failed.', 'line-err');
+      } finally {
+        backfillRunning = false;
+        stopBackfillTimer();
+        backfillScanBtn.disabled = false;
+        updateBackfillSelectionUi();
+      }
+    });
 
     runBtn.addEventListener('click', () => {
       if (activeEs) {

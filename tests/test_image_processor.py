@@ -1,7 +1,22 @@
-from src.image_processor import process_image
+from io import BytesIO
+
+from PIL import Image
+
+from src.image_processor import (
+    HERO_WIDTH,
+    STANDARD_WIDTH,
+    generate_web_derivatives,
+    process_image,
+)
 
 
 class FakeGenerator:
+    def generate_all(self, _webp_bytes, _categories, filename="", context=None):
+        return "Headshots", "Person smiling outdoors", "portrait, outdoor"
+
+    def generate_alt_and_tags(self, _webp_bytes, filename="", context=None):
+        return "Person smiling outdoors", "portrait, outdoor"
+
     def generate_category(self, _webp_bytes, _categories, filename=""):
         return "Headshots"
 
@@ -45,6 +60,74 @@ PNG_BYTES = (
 )
 
 
+def _image_bytes(width, height, *, image_format="PNG", mode="RGB", exif=None):
+    color = (20, 80, 140, 96) if mode == "RGBA" else (20, 80, 140)
+    image = Image.new(mode, (width, height), color)
+    buf = BytesIO()
+    save_kwargs = {"format": image_format}
+    if exif is not None:
+        save_kwargs["exif"] = exif
+    image.save(buf, **save_kwargs)
+    return buf.getvalue()
+
+
+def _opened_size(content):
+    with Image.open(BytesIO(content)) as image:
+        return image.size
+
+
+def test_landscape_original_generates_hero_and_standard_derivatives():
+    result = generate_web_derivatives(_image_bytes(3200, 1800))
+
+    assert result["original"]["qualityTier"] == "hero-ready"
+    assert _opened_size(result["hero"]["bytes"]) == (HERO_WIDTH, 1440)
+    assert _opened_size(result["standard"]["bytes"]) == (STANDARD_WIDTH, 900)
+    assert result["hero"]["format"] == "WEBP"
+    assert result["standard"]["quality"] == 82
+
+
+def test_2000px_original_only_generates_standard_and_is_standard_only():
+    result = generate_web_derivatives(_image_bytes(2000, 1000))
+
+    assert result["hero"] is None
+    assert _opened_size(result["standard"]["bytes"]) == (1600, 800)
+    assert result["original"]["qualityTier"] == "standard-only"
+
+
+def test_1600px_original_is_not_upscaled():
+    result = generate_web_derivatives(_image_bytes(1600, 900))
+
+    assert result["hero"] is None
+    assert _opened_size(result["standard"]["bytes"]) == (1600, 900)
+
+
+def test_below_1600_is_low_resolution_and_legacy_webp_is_not_upscaled():
+    result = generate_web_derivatives(_image_bytes(1200, 800))
+
+    assert result["original"]["qualityTier"] == "low-resolution"
+    assert result["hero"] is None
+    assert _opened_size(result["standard"]["bytes"]) == (1200, 800)
+
+
+def test_exif_orientation_and_aspect_ratio_are_honored():
+    exif = Image.Exif()
+    exif[274] = 6  # rotate 90 degrees clockwise for display
+    raw = _image_bytes(1200, 2000, image_format="JPEG", exif=exif)
+
+    result = generate_web_derivatives(raw)
+
+    assert (result["original"]["width"], result["original"]["height"]) == (2000, 1200)
+    assert _opened_size(result["standard"]["bytes"]) == (1600, 960)
+
+
+def test_transparency_is_preserved():
+    result = generate_web_derivatives(_image_bytes(1800, 900, mode="RGBA"))
+
+    with Image.open(BytesIO(result["standard"]["bytes"])) as image:
+        assert image.mode == "RGBA"
+        assert image.getchannel("A").getextrema()[1] < 255
+
+
 def test_process_image_raises_when_record_creation_fails(tmp_path):
     generator = FakeGenerator()
     list_client = RecordingListClient(record=None)
@@ -84,5 +167,12 @@ def test_process_image_returns_result_when_record_creation_succeeds(tmp_path):
 
     assert result["status"] == "pending-review"
     assert result["filename"].endswith(".webp")
-    assert len(sp_client.uploads) == 2
+    assert len(sp_client.uploads) == 3
     assert list_client.calls[0]["location"].startswith("Headshots/")
+    assert result["qualityTier"] == "low-resolution"
+    assert result["focalPoint"] == {"x": 0.5, "y": 0.5}
+    # Existing response keys remain available alongside additive delivery data.
+    for legacy_key in ("slug", "filename", "alt_text", "tags", "location", "high_res_location", "status"):
+        assert legacy_key in result
+    for additive_key in ("original", "hero", "standard", "width", "height", "qualityTier", "focalPoint"):
+        assert additive_key in result

@@ -147,9 +147,22 @@ Register in `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
 | Tool | Description |
 | ---- | ----------- |
-| `search_image_library` | Search the image library by keyword; returns ranked results with thumbnails |
+| `search_image_library` | Search the image library by keyword; returns ranked results with thumbnails and any available backfill action |
 | `search_stock_photos` | Search Pexels, Shutterstock, Unsplash, Pixabay concurrently |
 | `catalog_image_from_file` | Accept a base64 image, run the full processing pipeline, add to library |
+| `backfill_image_derivatives` | Explicitly backfill a selected result after the user confirms; never runs automatically |
+
+Newly ingested assets retain the legacy `location` and `webp_url` fields while adding `original`, `hero`, `standard`, `width`, `height`, `qualityTier`, `focalPoint`, `preferredHeroUrl`, and `standardWebUrl` when sidecar metadata is available. Existing catalog records without sidecars continue to return their legacy fields unchanged.
+
+### Hero-readiness dry run
+
+Run the read-only inventory before any separately approved backfill:
+
+```bash
+.venv/bin/python scripts/inventory_hero_readiness.py > hero-readiness.json
+```
+
+The report groups originals that are at least 2560px wide, exactly 1600px wide, 1601–2559px wide, below 1600px, unavailable, and missing source/rights/focal-point metadata. It does not write derivatives or modify records.
 
 ### Claude Article Automation API
 

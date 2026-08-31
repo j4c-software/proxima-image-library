@@ -22,6 +22,7 @@ def security_app(monkeypatch, tmp_path):
         "RATE_LIMIT_WINDOW_SECONDS": "60",
         "RATE_LIMIT_AUTH_REQUESTS": "5",
         "RATE_LIMIT_STREAM_REQUESTS": "3",
+        "MCP_INTERNAL_SECRET": "test-mcp-secret",
     }
     for key, value in env.items():
         monkeypatch.setenv(key, value)
@@ -131,3 +132,76 @@ def test_m13_mark_rejects_expected_count_mismatch(client):
     assert response.status_code == 409
     payload = response.get_json()
     assert payload["error"] == "expected_count does not match record_ids length"
+
+
+def test_editor_can_patch_focal_point(client, monkeypatch, tmp_path):
+    import src.app as app_module
+    from src.image_metadata import write_metadata
+
+    _login(client)
+    monkeypatch.setattr(
+        app_module,
+        "get_all_records",
+        lambda: [{"id": "rec-1", "fields": {"Slug": "wide-image"}}],
+    )
+    write_metadata(
+        {"slug": "wide-image", "focalPoint": {"x": 0.5, "y": 0.5}},
+        storage_mode="local",
+        image_folder=str(tmp_path),
+    )
+
+    response = client.patch(
+        "/api/image/focal-point",
+        json={"id": "rec-1", "x": 0.2, "y": 0.75},
+        headers={"Origin": "http://localhost", "Referer": "http://localhost/library"},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["focalPoint"] == {"x": 0.2, "y": 0.75}
+
+
+def test_exact_asset_delivery_preserves_webp_bytes(client, tmp_path):
+    content = b"RIFF-test-webp-content"
+    asset = tmp_path / "Hero" / "Banners" / "wide-image.webp"
+    asset.parent.mkdir(parents=True)
+    asset.write_bytes(content)
+
+    response = client.get(
+        "/api/mcp/asset",
+        query_string={
+            "area": "Hero",
+            "path": "Banners/wide-image.webp",
+            "key": "test-mcp-secret",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.data == content
+    assert response.content_type == "image/webp"
+
+
+def test_selective_backfill_candidate_scan_is_read_only(client, monkeypatch):
+    import src.app as app_module
+
+    _login(client, email="admin@example.com")
+    monkeypatch.setattr(app_module, "_records_snapshot", lambda use_cache=False: [])
+
+    response = client.get("/api/maintenance/hero-backfill/candidates?status=approved")
+
+    assert response.status_code == 200
+    assert response.get_json()["candidateCount"] == 0
+    assert response.get_json()["dryRun"] is True
+
+
+def test_selective_backfill_requires_an_exact_nonempty_selection(client):
+    _login(client, email="admin@example.com")
+    headers = {"Origin": "http://localhost", "Referer": "http://localhost/maintenance"}
+
+    response = client.post(
+        "/api/maintenance/hero-backfill/run",
+        json={"record_ids": [], "expected_count": 0},
+        headers=headers,
+    )
+
+    assert response.status_code == 400
+    assert response.get_json()["error"] == "Select at least one record"
