@@ -67,8 +67,8 @@ jobs:
         env:
           PETE_DEPLOYMENT_ID: ${{ inputs.pete_deployment_id }}
         run: |
-          printf '%s' "${PETE_DEPLOYMENT_ID}" | grep -Eq '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$' || {
-            echo "A full Azure Kudu deployment ID is required to restore Pete MCP." >&2
+          test "${PETE_DEPLOYMENT_ID}" = "4d21efc3-6f6c-4acb-b0e9-c6c2daf0440a" || {
+            echo "This guarded restore only permits the verified Pete MCP package 4d21efc3-6f6c-4acb-b0e9-c6c2daf0440a." >&2
             exit 1
           }
 
@@ -84,19 +84,36 @@ jobs:
             --uri "https://management.azure.com/subscriptions/9528fb58-4fa4-43f8-9940-e5c3e1f1903f/resourceGroups/PP-Resources/providers/Microsoft.Web/sites/PP-MCP-Server/basicPublishingCredentialsPolicies/scm?api-version=2022-09-01" \
             --body '{"properties":{"allow":true}}'
 
-      - name: Restore prior Pete MCP package
-        env:
-          PETE_DEPLOYMENT_ID: ${{ inputs.pete_deployment_id }}
+      - name: Restore verified Pete MCP package
         run: |
           set -euo pipefail
           PUBLISHING_USER=$(az webapp deployment list-publishing-credentials --resource-group PP-Resources --name PP-MCP-Server --query publishingUserName -o tsv)
           PUBLISHING_PASSWORD=$(az webapp deployment list-publishing-credentials --resource-group PP-Resources --name PP-MCP-Server --query publishingPassword -o tsv)
+
+          # Confirm the archived OneDeploy package exists before switching the active pointer.
+          curl --fail-with-body --silent --show-error \
+            --user "${PUBLISHING_USER}:${PUBLISHING_PASSWORD}" \
+            --range 0-0 \
+            --output /dev/null \
+            "https://pp-mcp-server.scm.azurewebsites.net/api/vfs/data/SitePackages/20260825061243.zip"
+
+          # This is the exact package named in the verified deployment log for 4d21efc.
           curl --fail-with-body --silent --show-error \
             --user "${PUBLISHING_USER}:${PUBLISHING_PASSWORD}" \
             --request PUT \
-            --header 'Content-Type: application/json' \
-            --data '{"clean":false,"needFileUpdate":true}' \
-            "https://pp-mcp-server.scm.azurewebsites.net/api/deployments/${PETE_DEPLOYMENT_ID}"
+            --header 'Content-Type: text/plain' \
+            --header 'If-Match: *' \
+            --data-binary '20260825061243.zip' \
+            "https://pp-mcp-server.scm.azurewebsites.net/api/vfs/data/SitePackages/packagename.txt"
+
+          # Match OneDeploy's package activation behavior.
+          curl --fail-with-body --silent --show-error \
+            --user "${PUBLISHING_USER}:${PUBLISHING_PASSWORD}" \
+            --request PUT \
+            --header 'Content-Type: text/plain' \
+            --header 'If-Match: *' \
+            --data-binary '' \
+            "https://pp-mcp-server.scm.azurewebsites.net/api/vfs/site/wwwroot/restartTrigger.txt"
 
       - name: Disable Pete MCP SCM publishing authentication
         if: always()
