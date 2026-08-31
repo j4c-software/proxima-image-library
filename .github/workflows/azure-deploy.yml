@@ -29,6 +29,24 @@ jobs:
     timeout-minutes: 15
 
     steps:
+      - name: Validate deployment target
+        env:
+          DEPLOY_TARGET: ${{ inputs.app_name || 'PP-MCP-Server' }}
+          RESTORE_REF: ${{ inputs.source_ref }}
+          TRIGGER: ${{ github.event_name }}
+        run: |
+          echo "Deploy target: ${DEPLOY_TARGET}"
+          if [ "${DEPLOY_TARGET}" = "PP-App-Serv" ]; then
+            test "${TRIGGER}" = "workflow_dispatch" || {
+              echo "PP-App-Serv may only be targeted by an explicit manual restore run." >&2
+              exit 1
+            }
+            printf '%s' "${RESTORE_REF}" | grep -Eq '^[0-9a-f]{40}$' || {
+              echo "PP-App-Serv restores require a full 40-character commit SHA." >&2
+              exit 1
+            }
+          fi
+
       - uses: actions/checkout@v4
         with:
           ref: ${{ inputs.source_ref || github.sha }}

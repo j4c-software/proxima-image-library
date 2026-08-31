@@ -143,6 +143,20 @@ Register in `~/Library/Application Support/Claude/claude_desktop_config.json`:
 
 `TEST_MODE` and `STORAGE_MODE` are set explicitly here because Claude Desktop may not load `.env` from `cwd` reliably.
 
+## Production deployment safety
+
+Authoritative production mapping:
+
+| Public domain | Azure App Service | Normal deployment path |
+| --- | --- | --- |
+| `library.liveproxima.org` | `PP-MCP-Server` | Push to `main` |
+
+Before calling a deployment successful, verify the public hostname resolves to the intended App Service. Do not infer the target from an App Service name, a previous workflow run, or an Azure "Running" status.
+
+`PP-App-Serv` is **not** the normal target for this image library. It can only be selected through a manual workflow dispatch for a corrective restore, and that restore must specify a full 40-character Git commit SHA. Never select it for `library.liveproxima.org` without separate authorization and hostname verification.
+
+For every deployment, record the commit SHA, target App Service, GitHub Actions run URL, deployment outcome, and a live authenticated route check. If authenticated checking is unavailable, record the exact authorization blocker rather than claiming application-level verification.
+
 ### MCP Tools
 
 | Tool | Description |
