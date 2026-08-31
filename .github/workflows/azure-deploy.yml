@@ -4,6 +4,20 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      app_name:
+        description: App Service to deploy
+        required: true
+        default: PP-MCP-Server
+        type: choice
+        options:
+          - PP-MCP-Server
+          - PP-App-Serv
+      source_ref:
+        description: Optional commit or ref to deploy (defaults to the triggering commit)
+        required: false
+        default: ""
+        type: string
 
 concurrency:
   group: azure-deploy-main
@@ -16,6 +30,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.source_ref || github.sha }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -34,6 +50,6 @@ jobs:
       - name: Deploy to Azure Web App
         uses: azure/webapps-deploy@v3
         with:
-          # library.liveproxima.org is bound to this App Service.
-          app-name: PP-MCP-Server
+          # library.liveproxima.org is bound to PP-MCP-Server.
+          app-name: ${{ inputs.app_name || 'PP-MCP-Server' }}
           startup-command: 'bash startup.sh'
