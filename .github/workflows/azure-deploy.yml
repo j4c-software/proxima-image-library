@@ -34,5 +34,6 @@ jobs:
       - name: Deploy to Azure Web App
         uses: azure/webapps-deploy@v3
         with:
-          app-name: PP-App-Serv
+          # library.liveproxima.org is bound to this App Service.
+          app-name: PP-MCP-Server
           startup-command: 'bash startup.sh'
