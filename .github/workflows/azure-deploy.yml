@@ -90,6 +90,24 @@ jobs:
           PUBLISHING_USER=$(az webapp deployment list-publishing-credentials --resource-group PP-Resources --name PP-MCP-Server --query publishingUserName -o tsv)
           PUBLISHING_PASSWORD=$(az webapp deployment list-publishing-credentials --resource-group PP-Resources --name PP-MCP-Server --query publishingPassword -o tsv)
 
+          # Enabling SCM Basic auth is asynchronous. Wait until Kudu accepts the
+          # newly enabled publishing credentials before changing any package files.
+          SCM_READY=false
+          for _attempt in $(seq 1 12); do
+            if curl --fail --silent --show-error \
+              --user "${PUBLISHING_USER}:${PUBLISHING_PASSWORD}" \
+              --output /dev/null \
+              "https://pp-mcp-server.scm.azurewebsites.net/api/settings"; then
+              SCM_READY=true
+              break
+            fi
+            sleep 5
+          done
+          test "${SCM_READY}" = true || {
+            echo "SCM publishing authentication did not become available in time." >&2
+            exit 1
+          }
+
           # Confirm the archived OneDeploy package exists before switching the active pointer.
           curl --fail-with-body --silent --show-error \
             --user "${PUBLISHING_USER}:${PUBLISHING_PASSWORD}" \
