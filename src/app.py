@@ -33,6 +33,7 @@ from PIL import Image as PILImage
 from werkzeug.exceptions import RequestEntityTooLarge
 
 from src.local_client import LocalClient
+from src import __version__
 from src.config import Config
 from src import ingest_poller
 from src.maintenance_helpers import (
@@ -567,7 +568,7 @@ def api_version():
         short = sha[:7]
     except Exception:
         sha, short = "unknown", "unknown"
-    return jsonify({"commit": sha, "short": short})
+    return jsonify({"version": __version__, "commit": sha, "short": short})
 
 
 @app.route("/debug/metrics")
@@ -603,7 +604,7 @@ def debug_metrics():
 def index():
     user = session.get("user", {})
     is_admin = _is_maintenance_admin_user(user)
-    return render_template("index.html", user=user, is_admin=is_admin)
+    return render_template("index.html", user=user, is_admin=is_admin, app_version=__version__)
 
 
 # ------------------------------------------------------------------

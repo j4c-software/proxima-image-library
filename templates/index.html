@@ -62,6 +62,10 @@
       font-size: 15px; font-weight: 700;
       color: var(--accent); white-space: nowrap;
     }
+    .app-version {
+      color: var(--muted); font-size: 11px; font-weight: 600;
+      letter-spacing: 0.02em; white-space: nowrap;
+    }
 
     /* compact search — visible in browse mode */
     #header-search-wrap {
@@ -502,6 +506,7 @@
   <a href="/" class="header-logo">
     <img src="/static/logo.png" alt="Proxima" />
     <span>Image Library</span>
+    <small class="app-version" aria-label="Application version">{{ app_version }}</small>
   </a>
 
   <!-- compact search — only visible in browse mode -->
