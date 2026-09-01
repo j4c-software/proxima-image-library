@@ -95,6 +95,11 @@ Steps required before and after each production deployment to Azure App Service.
 - [ ] Trigger deployment from GitHub Actions or push to `main`
 - [ ] Watch the GitHub Actions run created from the latest push and wait for a clean success before testing production
 - [ ] In Azure App Service -> Deployment Center / Log stream, confirm the app boots with `bash startup.sh`
+- The workflow sets `WEBSITE_RUN_FROM_PACKAGE=1` on `PP-App-Serv` before every deploy so Kudu mounts the zip
+  read-only instead of extracting its ~3,700 vendored dependency files one by one (this cut deploy time from
+  2–7 minutes to well under a minute). Because of this, `/home/site/wwwroot` is read-only at runtime — any
+  feature that needs to persist state must write under `/home/...` (see `maintenance_helpers.py` and the
+  `_DOT_ENV_PATH` / `_SS_COUNTER_PATH` handling in `app.py` for the existing pattern), never back into the app directory.
 
 ### Current live deploy note
 

@@ -51,6 +51,14 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
+      - name: Ensure run-from-package is enabled
+        run: |
+          az webapp config appsettings set \
+            --resource-group PP-Resources \
+            --name PP-App-Serv \
+            --settings WEBSITE_RUN_FROM_PACKAGE=1 \
+            --output none
+
       - name: Deploy to Image Library App Service
         uses: azure/webapps-deploy@v3
         with:

@@ -5773,7 +5773,11 @@ _STOCK_API_PROVIDERS = {
     },
 }
 
-_DOT_ENV_PATH = Path(__file__).resolve().parent.parent / ".env"
+_DOT_ENV_PATH = Path(
+    "/home/proxima_stock_keys.env"
+    if Path("/home").exists() and os.getenv("WEBSITE_INSTANCE_ID")
+    else Path(__file__).resolve().parent.parent / ".env"
+)
 
 
 def _mask(value: str) -> str:
