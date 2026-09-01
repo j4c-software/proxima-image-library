@@ -233,14 +233,15 @@
       letter-spacing: 0.08em; color: var(--muted); margin-bottom: 16px;
     }
     #recent-strip {
-      display: flex; gap: 12px;
+      display: grid; grid-template-rows: repeat(2, auto); grid-auto-flow: column;
+      grid-auto-columns: 148px; gap: 12px;
       overflow-x: auto; padding-bottom: 8px;
     }
     #recent-strip::-webkit-scrollbar { height: 4px; }
     #recent-strip::-webkit-scrollbar-track { background: transparent; }
     #recent-strip::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
     .recent-card {
-      flex-shrink: 0; width: 148px; cursor: pointer;
+      width: 148px; cursor: pointer;
       background: var(--surface); border: 1px solid var(--border);
       border-radius: var(--radius); overflow: hidden;
       box-shadow: var(--shadow); transition: transform 0.15s, box-shadow 0.15s;
@@ -803,7 +804,7 @@
 
   function renderRecentStrip() {
     const el = document.getElementById('recent-strip');
-    const recent = allImages.filter(img => img.location && !['rejected', 'archived', 'ingested'].includes(img.status)).slice(-10).reverse();
+    const recent = allImages.filter(img => img.location && !['rejected', 'archived', 'ingested'].includes(img.status)).slice(-20).reverse();
     if (!recent.length) {
       document.getElementById('recent-section').style.display = 'none';
       return;
