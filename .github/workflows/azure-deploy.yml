@@ -51,13 +51,17 @@ jobs:
         with:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
-      - name: Ensure run-from-package is enabled
+      - name: Revert run-from-package (caused a stuck deploy / 503)
         run: |
           az webapp config appsettings set \
             --resource-group PP-Resources \
             --name PP-App-Serv \
-            --settings WEBSITE_RUN_FROM_PACKAGE=1 \
+            --settings WEBSITE_RUN_FROM_PACKAGE=0 \
             --output none
+          # Give the app-settings-triggered restart time to settle before
+          # the next step pushes a new zip — deploying immediately after
+          # an appsettings change is the suspected cause of the last hang.
+          sleep 30
 
       - name: Deploy to Image Library App Service
         uses: azure/webapps-deploy@v3
