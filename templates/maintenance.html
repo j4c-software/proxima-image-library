@@ -4537,6 +4537,17 @@
     // ── Tag Manager ──────────────────────────────────────────────────────────
     let _tmLibrary = {};
 
+    function tmEscapeHtml(s) {
+      return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    function tmCategoryOptions() {
+      const cats = Object.keys(_tmLibrary).sort();
+      if (!cats.includes('Custom')) cats.push('Custom');
+      return cats;
+    }
+
     function tmAcknowledgeAndCollapse(message, delayMs = 2400) {
       const panel = document.getElementById('tm-panel');
       const icon = document.getElementById('tm-toggle-icon');

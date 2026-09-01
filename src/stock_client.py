@@ -88,20 +88,35 @@ def search_pexels(phrase: str, limit: int = 8, page: int = 1) -> dict:
         results = []
         for item in data.get("photos", []):
             title = item.get("alt", "") or phrase
+            src = item.get("src", {})
+            width = item.get("width")
+            height = item.get("height")
+            sizes = []
+            if src.get("original"):
+                sizes.append({"label": "Original", "url": src["original"], "width": width, "height": height})
+            if src.get("large2x"):
+                sizes.append({"label": "Large (2x)", "url": src["large2x"]})
+            if src.get("large"):
+                sizes.append({"label": "Large", "url": src["large"]})
+            if src.get("medium"):
+                sizes.append({"label": "Medium", "url": src["medium"]})
+            if src.get("small"):
+                sizes.append({"label": "Small", "url": src["small"]})
             results.append({
-                "thumb": item.get("src", {}).get("medium", ""),
+                "thumb": src.get("medium", ""),
                 "preview_url": (
-                    item.get("src", {}).get("large2x")
-                    or item.get("src", {}).get("large")
-                    or item.get("src", {}).get("original", "")
+                    src.get("large2x")
+                    or src.get("large")
+                    or src.get("original", "")
                 ),
-                "download_url": item.get("src", {}).get("original", ""),
+                "download_url": src.get("original", ""),
+                "sizes": sizes,
                 "title": title,
                 "link": item.get("url", ""),
                 "photographer": item.get("photographer", ""),
                 "photographer_url": item.get("photographer_url", ""),
-                "width": item.get("width"),
-                "height": item.get("height"),
+                "width": width,
+                "height": height,
                 "color": item.get("avg_color", ""),
             })
         return {"results": results, "error": None}
@@ -193,10 +208,22 @@ def search_pixabay(phrase: str, limit: int = 8, page: int = 1) -> dict:
         results = []
         for item in data.get("hits", []):
             tags = item.get("tags", "")
+            sizes = []
+            if item.get("largeImageURL"):
+                sizes.append({
+                    "label": "Large", "url": item["largeImageURL"],
+                    "width": item.get("imageWidth"), "height": item.get("imageHeight"),
+                })
+            if item.get("webformatURL"):
+                sizes.append({
+                    "label": "Medium", "url": item["webformatURL"],
+                    "width": item.get("webformatWidth"), "height": item.get("webformatHeight"),
+                })
             results.append({
                 "thumb": item.get("webformatURL", ""),
                 "preview_url": item.get("largeImageURL", "") or item.get("webformatURL", ""),
                 "download_url": item.get("largeImageURL", ""),
+                "sizes": sizes,
                 "title": tags,
                 "link": item.get("pageURL", ""),
                 "width": item.get("imageWidth"),
@@ -248,21 +275,32 @@ def search_unsplash(phrase: str, limit: int = 8, page: int = 1) -> dict:
                 item.get("links", {}).get("html", "")
                 + "?utm_source=proxima_image_library&utm_medium=referral"
             )
+            urls = item.get("urls", {})
+            width = item.get("width")
+            height = item.get("height")
+            sizes = []
+            if urls.get("full"):
+                sizes.append({"label": "Full", "url": urls["full"], "width": width, "height": height})
+            if urls.get("regular"):
+                sizes.append({"label": "Regular", "url": urls["regular"]})
+            if urls.get("small"):
+                sizes.append({"label": "Small", "url": urls["small"]})
             results.append({
-                "thumb": item.get("urls", {}).get("small", ""),
+                "thumb": urls.get("small", ""),
                 "preview_url": (
-                    item.get("urls", {}).get("regular")
-                    or item.get("urls", {}).get("full")
-                    or item.get("urls", {}).get("small", "")
+                    urls.get("regular")
+                    or urls.get("full")
+                    or urls.get("small", "")
                 ),
-                "download_url": item.get("urls", {}).get("full", ""),
+                "download_url": urls.get("full", ""),
                 "download_location": item.get("links", {}).get("download_location", ""),
+                "sizes": sizes,
                 "title": item.get("alt_description") or item.get("description") or "",
                 "link": photo_link,
                 "photographer": photographer,
                 "photographer_url": profile_url,
-                "width": item.get("width"),
-                "height": item.get("height"),
+                "width": width,
+                "height": height,
                 "color": item.get("color", ""),
                 "likes": item.get("likes"),
                 "tags": [t.get("title", "") for t in item.get("tags", []) if t.get("title")],
@@ -278,14 +316,22 @@ def search_unsplash(phrase: str, limit: int = 8, page: int = 1) -> dict:
 # Concurrent multi-library search
 # ---------------------------------------------------------------------------
 
-def search_all_libraries(phrases: list, limit: int = 8, page: int = 1) -> list:
-    """Search all three libraries for all phrases concurrently."""
-    searchers = {
+def search_all_libraries(phrases: list, limit: int = 8, page: int = 1, libraries: list | None = None) -> list:
+    """Search all three libraries for all phrases concurrently.
+
+    `libraries` restricts the search to a subset of library keys (e.g. ["pexels"]);
+    omit to search all of them.
+    """
+    all_searchers = {
         "pexels": search_pexels,
         "shutterstock": search_shutterstock,
         "unsplash": search_unsplash,
         "pixabay": search_pixabay,
     }
+    searchers = (
+        {k: v for k, v in all_searchers.items() if k in libraries}
+        if libraries else all_searchers
+    )
 
     results_map = {p: {} for p in phrases}
     max_workers = min(len(phrases) * 4, 16)

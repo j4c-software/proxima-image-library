@@ -732,11 +732,13 @@ def api_stock_search():
     phrases = data.get("phrases", [])
     limit = max(1, min(int(data.get("limit", 25)), 25))
     page = max(1, min(int(data.get("page", 1)), 100))
+    library = (data.get("library") or "").strip()
     if not phrases:
         return jsonify({"error": "No phrases provided"}), 400
     phrases = phrases[:20]
     from src.stock_client import search_all_libraries
-    results = search_all_libraries(phrases, limit, page)
+    libraries = [library] if library else None
+    results = search_all_libraries(phrases, limit, page, libraries=libraries)
     return jsonify({"results": results, "page": page, "limit": limit})
 
 

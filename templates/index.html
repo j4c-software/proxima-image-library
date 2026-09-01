@@ -437,7 +437,6 @@
       font-family: 'Montserrat', sans-serif;
       font-size: 15px; font-weight: 700; word-break: break-all;
     }
-    #detail-dims { font-size: 12px; color: var(--muted); }
     .detail-field label {
       display: block; font-size: 10px; font-weight: 700;
       text-transform: uppercase; letter-spacing: 0.07em;
@@ -652,7 +651,10 @@
     <div id="detail-body">
       <div>
         <div id="detail-filename"></div>
-        <div id="detail-dims"></div>
+      </div>
+      <div class="detail-field">
+        <label>Size</label>
+        <p id="detail-dims">—</p>
       </div>
       <div class="detail-field">
         <label>Alt Text</label>
@@ -669,6 +671,7 @@
       <div id="detail-actions">
         <button class="btn btn-primary" id="btn-copy">Copy path</button>
         <button class="btn btn-ghost" id="btn-open">Open full image</button>
+        <button class="btn btn-ghost" id="btn-show-similar">Show Similar</button>
         <button class="btn btn-danger" id="btn-delete" style="margin-left:auto;">Delete</button>
       </div>
       <div id="detail-delete-confirm" style="display:none; margin-top:10px; padding:10px; background:#fff3f3; border:1px solid #fca5a5; border-radius:6px; font-size:13px;">
@@ -1032,20 +1035,22 @@
     document.getElementById('detail-img').src  = '/image?path=' + encodeURIComponent(img.location);
     document.getElementById('detail-img').alt  = img.alt_text || '';
     document.getElementById('detail-filename').textContent = img.filename || '';
-    document.getElementById('detail-dims').textContent = '';
+    document.getElementById('detail-dims').textContent = 'Loading…';
     document.getElementById('detail-alt').textContent  = img.alt_text || '—';
     document.getElementById('detail-loc').textContent  = img.location || '';
     const tags = (img.tags || '').split(',').map(t => t.trim()).filter(Boolean);
     document.getElementById('detail-tags').innerHTML = tags.length
       ? tags.map(t => `<span class="detail-tag">${esc(t)}</span>`).join('')
       : '<span style="color:var(--muted);font-size:13px">None</span>';
+    document.getElementById('btn-show-similar').style.display = tags.length ? '' : 'none';
     document.getElementById('btn-copy').textContent = 'Copy path';
     document.getElementById('detail-overlay').classList.add('open');
     fetch('/api/image-info?path=' + encodeURIComponent(img.location))
       .then(r => r.json()).then(d => {
-        if (d.width) document.getElementById('detail-dims').textContent =
-          `${d.width} × ${d.height} px · ${d.file_size || ''}`;
-      }).catch(() => {});
+        document.getElementById('detail-dims').textContent = d.width
+          ? `${d.width} × ${d.height} px · ${d.file_size || ''}`
+          : 'Unknown';
+      }).catch(() => { document.getElementById('detail-dims').textContent = 'Unknown'; });
   }
 
   function closeDetail() {
@@ -1068,6 +1073,30 @@
   });
   document.getElementById('btn-open').addEventListener('click', () => {
     if (currentImage) window.open('/image?path=' + encodeURIComponent(currentImage.location), '_blank');
+  });
+  document.getElementById('btn-show-similar').addEventListener('click', () => {
+    if (!currentImage) return;
+    const tags = (currentImage.tags || '').split(',').map(t => t.trim()).filter(Boolean);
+    if (!tags.length) return;
+    const label = `Similar to "${currentImage.filename || 'this image'}"`;
+    closeDetail();
+    searchQ = '';
+    syncHeaderSearch('');
+    activeFolders.clear();
+    activeStatus = '';
+    activeTags = new Set(tags.slice(0, 4));
+    document.getElementById('folder-list').querySelectorAll('.sidebar-item').forEach(i => {
+      i.classList.toggle('active', i.dataset.folder === '');
+    });
+    document.getElementById('status-list').querySelectorAll('.sidebar-item').forEach(i => {
+      i.classList.toggle('active', i.dataset.status === '');
+    });
+    renderTagStrip(allTags);
+    if (!inBrowseMode) enterBrowse(label);
+    else {
+      document.getElementById('browse-active-filter').textContent = label;
+      renderGrid();
+    }
   });
 
   const deleteConfirmEl = document.getElementById('detail-delete-confirm');

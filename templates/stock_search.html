@@ -316,8 +316,24 @@
       padding: 2px 9px; background: #f3f4f6; border-radius: 20px;
       font-size: 11px; color: #374151;
     }
+    #dl-size-row {
+      display: flex; align-items: center; gap: 8px; margin-bottom: 12px;
+    }
+    #dl-size-row label {
+      font-size: 12px; font-weight: 600; color: #374151;
+    }
+    #dl-size-select {
+      flex: 1; padding: 6px 10px; border-radius: 8px; border: 1px solid #d1d5db;
+      background: #fff; color: #111; font-size: 12px; font-family: inherit;
+    }
+    .dl-similar-btn {
+      padding: 8px 16px; border-radius: 20px; border: 1.5px solid #d1d5db;
+      background: #fff; color: #374151; font-size: 13px; font-weight: 500;
+      cursor: pointer; font-family: inherit;
+    }
+    .dl-similar-btn:hover { border-color: #9ca3af; }
     .dl-modal-actions {
-      display: flex; gap: 10px; justify-content: flex-end;
+      display: flex; gap: 10px; justify-content: flex-end; flex-wrap: wrap;
       padding: 12px 22px 16px; border-top: 1px solid #f3f4f6; flex-shrink: 0;
     }
     .dl-cancel { padding: 8px 20px; border-radius: 20px; border: 1px solid #e0e0e0; background: #fff; font-size: 13px; font-weight: 600; cursor: pointer; color: #6b7280; font-family: inherit; }
@@ -507,10 +523,15 @@
         <div id="dl-title"></div>
         <div id="dl-photographer"></div>
         <div id="dl-meta-grid"></div>
+        <div id="dl-size-row" class="hidden">
+          <label for="dl-size-select">Size</label>
+          <select id="dl-size-select"></select>
+        </div>
         <div id="dl-tags"></div>
       </div>
       <div class="dl-modal-actions">
         <button class="dl-cancel" id="dl-cancel" type="button">Cancel</button>
+        <button class="dl-similar-btn" id="dl-similar-btn" type="button">Show Similar</button>
         <button class="modal-preview-btn" id="dl-large-preview" type="button">Preview Larger</button>
         <button class="dl-download" id="dl-download" type="button">Download</button>
         <button class="dl-confirm" id="dl-confirm" type="button">Add to Library</button>
@@ -608,6 +629,8 @@
     let currentResultPage  = 1;
     let currentResultLimit = 25;
     let currentLibResults  = {};  // { pexels: {...}, unsplash: {...}, ... }
+    let currentLibraryOnly = null; // set to a library key to scope search + rendering to just it
+    let currentResultsLabel = '';  // overrides the "Results for ..." header when set
 
     const LIBS = [
       { key: 'pexels',       label: 'Pexels'       },
@@ -627,22 +650,35 @@
     const _qs = new URLSearchParams(window.location.search).get('q');
     if (_qs) { searchInput.value = _qs; doSearch(); }
 
-    async function doSearch(page = 1) {
+    function doSearch(page = 1) {
       const q = searchInput.value.trim();
       if (!q) { searchInput.focus(); return; }
+      currentLibraryOnly  = null;
+      currentResultsLabel = '';
+      return runSearch(q, page);
+    }
+
+    function loadMoreResults() {
+      return runSearch(currentQuery, currentResultPage + 1);
+    }
+
+    async function runSearch(q, page) {
       currentQuery = q;
       currentResultPage = page;
 
-      document.getElementById('loading-msg').textContent =
-        `Searching Pexels, Shutterstock, Unsplash, and Pixabay…`;
+      document.getElementById('loading-msg').textContent = currentLibraryOnly
+        ? 'Finding similar images…'
+        : `Searching Pexels, Shutterstock, Unsplash, and Pixabay…`;
       document.getElementById('step-results').classList.add('hidden');
       document.getElementById('step-loading').classList.remove('hidden');
 
       try {
+        const body = { phrases: [q], limit: currentResultLimit, page };
+        if (currentLibraryOnly) body.library = currentLibraryOnly;
         const res  = await fetch('/api/stock-search', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ phrases: [q], limit: currentResultLimit, page }),
+          body: JSON.stringify(body),
         });
         const data = await res.json();
         if (data.error) throw new Error(data.error);
@@ -657,17 +693,16 @@
       }
     }
 
-    async function loadMoreResults() {
-      await doSearch(currentResultPage + 1);
-    }
-
     // ── Render results ───────────────────────────────────────────────────
     function renderResults(item, page) {
       document.getElementById('results-title').textContent =
-        `Results for "${currentQuery}"`;
+        currentResultsLabel || `Results for "${currentQuery}"`;
 
-      const hasAnyResults = LIBS.some(({ key }) => ((item[key] && item[key].results) || []).length > 0);
-      const hasPotentialMore = LIBS.some(({ key }) => ((item[key] && item[key].results) || []).length === currentResultLimit);
+      const libs = currentLibraryOnly ? LIBS.filter(l => l.key === currentLibraryOnly) : LIBS;
+      document.getElementById('results-tabs').style.display = libs.length > 1 ? '' : 'none';
+
+      const hasAnyResults = libs.some(({ key }) => ((item[key] && item[key].results) || []).length > 0);
+      const hasPotentialMore = libs.some(({ key }) => ((item[key] && item[key].results) || []).length === currentResultLimit);
       const btn = document.getElementById('btn-more-photos');
       btn.disabled = !hasPotentialMore;
       document.getElementById('results-page-caption').textContent =
@@ -682,7 +717,7 @@
 
       tabsEl.className = 'lib-tabs';
 
-      LIBS.forEach(({ key, label }, i) => {
+      libs.forEach(({ key, label }, i) => {
         const libData    = item[key] || { results: [], error: 'No data returned' };
         const count      = (libData.results || []).length;
         const unconfigured = libData.error && libData.error.includes('not configured');
@@ -748,6 +783,7 @@
               tile.dataset.downloadUser           = img.user || '';
               tile.dataset.downloadType           = img.type || '';
               tile.dataset.downloadTags           = JSON.stringify(img.tags || []);
+              tile.dataset.downloadSizes          = JSON.stringify(img.sizes || []);
               if (img.download_location) tile.dataset.downloadLocation = img.download_location;
             }
 
@@ -902,7 +938,16 @@
     const dlCancel       = document.getElementById('dl-cancel');
     const dlLargePreview = document.getElementById('dl-large-preview');
     const dlConfirm      = document.getElementById('dl-confirm');
+    const dlSimilarBtn   = document.getElementById('dl-similar-btn');
+    const dlSizeRow      = document.getElementById('dl-size-row');
+    const dlSizeSelect   = document.getElementById('dl-size-select');
     let pendingDownload  = null;
+
+    function filenameFor(titleRaw, url) {
+      const raw = titleRaw.replace(/[^\w\s-]/g, '').trim().replace(/\s+/g, '-').slice(0, 60) || 'image';
+      const ext = url.split('?')[0].match(/\.(jpe?g|png|gif|webp)$/i)?.[1] || 'jpg';
+      return `${raw}.${ext}`;
+    }
 
     function fmtNum(n) { return Number(n).toLocaleString(); }
     function fmtBytes(b) {
@@ -933,11 +978,10 @@
       const user             = card.dataset.downloadUser;
       const type             = card.dataset.downloadType;
       const tags             = JSON.parse(card.dataset.downloadTags || '[]');
+      const sizes            = JSON.parse(card.dataset.downloadSizes || '[]');
       const thumbEl          = card.querySelector('img');
       const previewUrl       = card.dataset.previewUrl || url || (thumbEl ? thumbEl.src : '');
-      const raw     = titleRaw.replace(/[^\w\s-]/g, '').trim().replace(/\s+/g, '-').slice(0, 60) || 'image';
-      const ext     = url.split('?')[0].match(/\.(jpe?g|png|gif|webp)$/i)?.[1] || 'jpg';
-      const filename = `${raw}.${ext}`;
+      const filename = filenameFor(titleRaw, url);
 
       dlColorStrip.style.background = color || 'transparent';
       dlColorStrip.style.height     = color ? '4px' : '0';
@@ -979,9 +1023,40 @@
 
       dlTags.innerHTML = tags.map(t => `<span class="dl-tag">${escHtml(t)}</span>`).join('');
 
-      pendingDownload = { url, filename, dl: dlLocation, source, title: titleRaw, tags, photographer, previewUrl };
+      dlSizeRow.classList.toggle('hidden', sizes.length < 2);
+      dlSizeSelect.innerHTML = sizes.map((s, i) => {
+        const dims = s.width && s.height ? ` (${fmtNum(s.width)}×${fmtNum(s.height)})` : '';
+        return `<option value="${i}">${escHtml(s.label)}${dims}</option>`;
+      }).join('');
+      const defaultIdx = Math.max(0, sizes.findIndex(s => s.url === url));
+      dlSizeSelect.value = defaultIdx;
+
+      pendingDownload = { url, filename, dl: dlLocation, source, title: titleRaw, tags, photographer, previewUrl, sizes };
       resetDownloadButtonState();
       dlOverlay.classList.add('active');
+    });
+
+    dlSizeSelect.addEventListener('change', () => {
+      if (!pendingDownload) return;
+      const size = pendingDownload.sizes[Number(dlSizeSelect.value)];
+      if (!size) return;
+      pendingDownload.url      = size.url;
+      pendingDownload.filename = filenameFor(pendingDownload.title || 'image', size.url);
+    });
+
+    dlSimilarBtn.addEventListener('click', () => {
+      if (!pendingDownload) return;
+      const { source, title, tags } = pendingDownload;
+      const query = (tags && tags.length)
+        ? tags.slice(0, 4).join(' ')
+        : (title || '').replace(/[^\w\s-]/g, ' ').trim().split(/\s+/).slice(0, 6).join(' ');
+      if (!query) return;
+      const libLabel = (LIBS.find(l => l.key === source) || {}).label || source;
+      closeDlModal();
+      searchInput.value    = query;
+      currentLibraryOnly   = source;
+      currentResultsLabel  = `Similar to this ${libLabel} photo`;
+      runSearch(query, 1);
     });
 
     function closeDlModal() {
