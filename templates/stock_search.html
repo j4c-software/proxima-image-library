@@ -646,9 +646,20 @@
     searchBtn.addEventListener('click', () => doSearch());
     searchInput.addEventListener('keydown', e => { if (e.key === 'Enter') doSearch(); });
 
-    // Pre-fill from ?q= and auto-search if present
-    const _qs = new URLSearchParams(window.location.search).get('q');
-    if (_qs) { searchInput.value = _qs; doSearch(); }
+    // Pre-fill from ?q= (and optional ?library=) and auto-search if present
+    const _qs  = new URLSearchParams(window.location.search).get('q');
+    const _lib = new URLSearchParams(window.location.search).get('library');
+    if (_qs) {
+      searchInput.value = _qs;
+      const libMatch = LIBS.find(l => l.key === _lib);
+      if (libMatch) {
+        currentLibraryOnly  = libMatch.key;
+        currentResultsLabel = `Similar to this ${libMatch.label} photo`;
+        runSearch(_qs, 1);
+      } else {
+        doSearch();
+      }
+    }
 
     function doSearch(page = 1) {
       const q = searchInput.value.trim();
