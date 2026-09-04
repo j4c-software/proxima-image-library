@@ -41,6 +41,7 @@ jobs:
           az webapp config appsettings set \
             --resource-group PP-Resources \
             --name PP-App-Serv \
+            --slot staging \
             --settings WEBSITE_RUN_FROM_PACKAGE=0 \
             --output none
           # Give the app-settings-triggered restart time to settle before
@@ -48,8 +49,52 @@ jobs:
           # an appsettings change is the suspected cause of the last hang.
           sleep 30
 
-      - name: Deploy to Image Library App Service
+      - name: Deploy to staging slot
         uses: azure/webapps-deploy@v3
         with:
           app-name: PP-App-Serv
+          slot-name: staging
           startup-command: 'bash startup.sh'
+
+      - name: Wait for staging slot to become healthy
+        run: |
+          # The prior in-place-restart deploy could sever requests hitting
+          # production mid-restart (see incident notes above). Deploying to
+          # staging first and only swapping once it's actually answering
+          # health checks means production never runs a half-started process.
+          url="https://pp-app-serv-staging.azurewebsites.net/health"
+          for i in $(seq 1 20); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$url" || echo "000")
+            if [ "$code" = "200" ]; then
+              echo "Staging healthy after $i attempt(s)."
+              exit 0
+            fi
+            echo "Attempt $i: staging returned $code, retrying in 15s..."
+            sleep 15
+          done
+          echo "Staging slot never became healthy — aborting before swap."
+          exit 1
+
+      - name: Swap staging into production
+        run: |
+          az webapp deployment slot swap \
+            --resource-group PP-Resources \
+            --name PP-App-Serv \
+            --slot staging \
+            --target-slot production \
+            --output none
+
+      - name: Verify production after swap
+        run: |
+          url="https://library.liveproxima.org/health"
+          for i in $(seq 1 10); do
+            code=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 "$url" || echo "000")
+            if [ "$code" = "200" ]; then
+              echo "Production healthy after swap ($i attempt(s))."
+              exit 0
+            fi
+            echo "Attempt $i: production returned $code, retrying in 10s..."
+            sleep 10
+          done
+          echo "Production did not report healthy after swap."
+          exit 1
