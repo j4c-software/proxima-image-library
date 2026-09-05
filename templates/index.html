@@ -453,6 +453,17 @@
       padding: 3px 10px; background: var(--tag-bg);
       color: var(--tag-color); border-radius: 20px; font-size: 12px;
     }
+    .variation-row {
+      display: flex; align-items: center; justify-content: space-between;
+      gap: 10px; font-size: 13px; padding: 7px 12px;
+      background: var(--bg); border: 1px solid var(--border);
+      border-radius: var(--radius); margin-bottom: 6px;
+    }
+    .variation-row:last-child { margin-bottom: 0; }
+    .variation-label { font-weight: 600; }
+    .variation-dims { color: var(--muted); }
+    .variation-row a { color: var(--accent); font-weight: 600; text-decoration: none; }
+    .variation-row a:hover { text-decoration: underline; }
     #detail-actions { display: flex; gap: 10px; flex-wrap: wrap; margin-top: 4px; }
     .btn {
       padding: 9px 18px; border-radius: var(--radius); font-size: 13px;
@@ -669,9 +680,17 @@
         <label>Location</label>
         <p id="detail-loc" style="font-size:12px;color:var(--muted);"></p>
       </div>
+      <div class="detail-field" id="detail-source-wrap" style="display:none;">
+        <label>Source</label>
+        <p id="detail-source" style="font-size:12px;color:var(--muted);"></p>
+      </div>
+      <div class="detail-field" id="detail-variations-wrap" style="display:none;">
+        <label>Available Variations</label>
+        <div id="detail-variations"></div>
+      </div>
       <div id="detail-actions">
         <button class="btn btn-primary" id="btn-copy">Copy path</button>
-        <button class="btn btn-ghost" id="btn-open">Open full image</button>
+        <button class="btn btn-ghost" id="btn-open">Download</button>
         <button class="btn btn-ghost" id="btn-show-similar">Show Similar</button>
         <button class="btn btn-ghost" id="btn-search-stock">Search Stock</button>
         <button class="btn btn-danger" id="btn-delete" style="margin-left:auto;">Delete</button>
@@ -1053,6 +1072,36 @@
           ? `${d.width} × ${d.height} px · ${d.file_size || ''}`
           : 'Unknown';
       }).catch(() => { document.getElementById('detail-dims').textContent = 'Unknown'; });
+
+    const sourceWrap = document.getElementById('detail-source-wrap');
+    const sourceEl = document.getElementById('detail-source');
+    const variationsWrap = document.getElementById('detail-variations-wrap');
+    const variationsEl = document.getElementById('detail-variations');
+    sourceWrap.style.display = 'none';
+    sourceEl.innerHTML = '';
+    variationsWrap.style.display = 'none';
+    variationsEl.innerHTML = '';
+    fetch('/api/image/variations?path=' + encodeURIComponent(img.location))
+      .then(r => r.json()).then(d => {
+        const variations = d.variations || [];
+        if (variations.length) {
+          variationsEl.innerHTML = variations.map(v => `
+            <div class="variation-row">
+              <span class="variation-label">${esc(v.label)}</span>
+              <span class="variation-dims">${v.width && v.height ? `${v.width} × ${v.height} px` : ''}${v.fileSize ? ' · ' + esc(v.fileSize) : ''}</span>
+              <a href="${v.url}" target="_blank" rel="noopener">View</a>
+            </div>
+          `).join('');
+          variationsWrap.style.display = '';
+        }
+
+        const src = d.source;
+        if (src && src.sourceUrl) {
+          const bits = [src.provider, src.attribution].filter(Boolean).join(' — ');
+          sourceEl.innerHTML = `${bits ? esc(bits) + ' · ' : ''}<a href="${esc(src.sourceUrl)}" target="_blank" rel="noopener">${esc(src.sourceUrl)}</a>`;
+          sourceWrap.style.display = '';
+        }
+      }).catch(() => {});
   }
 
   function closeDetail() {
@@ -1074,7 +1123,15 @@
     });
   });
   document.getElementById('btn-open').addEventListener('click', () => {
-    if (currentImage) window.open('/image?path=' + encodeURIComponent(currentImage.location), '_blank');
+    if (!currentImage) return;
+    const a = document.createElement('a');
+    a.href = '/image?path=' + encodeURIComponent(currentImage.location);
+    a.download = currentImage.filename || '';
+    a.target = '_blank';
+    a.rel = 'noopener';
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
   });
   document.getElementById('btn-show-similar').addEventListener('click', () => {
     if (!currentImage) return;

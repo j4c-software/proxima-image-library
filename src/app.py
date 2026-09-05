@@ -17,7 +17,7 @@ from datetime import date, datetime
 from difflib import SequenceMatcher
 from io import BytesIO, StringIO
 from pathlib import Path, PurePosixPath
-from urllib.parse import unquote, urlparse
+from urllib.parse import quote, unquote, urlparse
 
 from dotenv import load_dotenv
 from typing import Dict, List, Optional
@@ -27,7 +27,7 @@ import functools
 
 import msal
 import requests
-from flask import Flask, Response, jsonify, redirect, render_template, request, session, stream_with_context, url_for
+from flask import Flask, Response, jsonify, redirect, render_template, request, send_file, session, stream_with_context, url_for
 from flask_cors import CORS
 from PIL import Image as PILImage
 from werkzeug.exceptions import RequestEntityTooLarge
@@ -2049,6 +2049,70 @@ def api_image_info():
         return jsonify({"error": "Internal server error"}), 500
 
 
+_VARIANT_AREAS = {"hero": "Hero", "standard": "WebP", "original": "High-Res"}
+_VARIANT_LABELS = {"hero": "Hero (2560px)", "standard": "Standard (1600px)", "original": "Original"}
+
+
+def _format_file_size(file_bytes: int) -> str:
+    if file_bytes >= 1_048_576:
+        return f"{file_bytes / 1_048_576:.1f} MB"
+    if file_bytes >= 1024:
+        return f"{file_bytes / 1024:.1f} KB"
+    return f"{file_bytes} B" if file_bytes else ""
+
+
+@app.route("/api/image/variations")
+@login_required
+def api_image_variations():
+    """Report which derivative variants (Hero/Standard/Original) exist for an image."""
+    location = unquote(request.args.get("path", ""))
+    if not location:
+        return jsonify({"error": "Missing path"}), 400
+    slug = PurePosixPath(location).stem
+
+    from src.image_metadata import read_metadata
+    metadata = read_metadata(
+        slug,
+        storage_mode=Config.STORAGE_MODE,
+        image_folder=Config.IMAGE_FOLDER,
+        sp_client=get_sp_client() if Config.STORAGE_MODE == "sharepoint" else None,
+    )
+    if not isinstance(metadata, dict) or not metadata:
+        return jsonify({"slug": slug, "qualityTier": None, "variations": [], "source": None})
+
+    original_meta = metadata.get("original") if isinstance(metadata.get("original"), dict) else {}
+    source_url = str(original_meta.get("sourceUrl", "") or "").strip()
+    source_info = {
+        "provider": str(original_meta.get("provider", "") or ""),
+        "attribution": str(original_meta.get("attribution", "") or ""),
+        "license": str(original_meta.get("license", "") or ""),
+        "sourceUrl": source_url,
+    } if source_url else None
+
+    variations = []
+    for key, area in _VARIANT_AREAS.items():
+        variant = metadata.get(key)
+        variant_location = variant.get("location") if isinstance(variant, dict) else ""
+        if not variant_location:
+            continue
+        variations.append({
+            "key": key,
+            "label": _VARIANT_LABELS[key],
+            "width": variant.get("width"),
+            "height": variant.get("height"),
+            "format": variant.get("format"),
+            "fileSize": _format_file_size(int(variant.get("fileSize", 0) or 0)),
+            "url": f"/image/download?area={quote(area)}&path={quote(variant_location)}",
+        })
+
+    return jsonify({
+        "slug": slug,
+        "qualityTier": metadata.get("qualityTier"),
+        "variations": variations,
+        "source": source_info,
+    })
+
+
 @app.route("/api/image/delete", methods=["POST"])
 @login_required
 def api_image_delete():
@@ -2111,6 +2175,35 @@ def thumbnail():
 @login_required
 def image():
     return _serve_image(thumb=False)
+
+
+@app.route("/image/download")
+@login_required
+def image_download():
+    """Serve one exact stored variant (Hero/Standard/Original) for viewing or download."""
+    area = request.args.get("area", "").strip()
+    location = unquote(request.args.get("path", ""))
+    if area not in {"Hero", "WebP", "High-Res"} or not location:
+        return Response("Invalid request", status=400)
+
+    rel = PurePosixPath(location)
+    if rel.is_absolute() or ".." in rel.parts:
+        return Response("Invalid path", status=400)
+
+    if Config.STORAGE_MODE == "sharepoint":
+        try:
+            root = Config.SHAREPOINT_IMAGE_FOLDER
+            sp_path = f"{root}/{area}/{location}" if root else f"{area}/{location}"
+            url = get_sp_client().get_file_url(sp_path)
+            return redirect(url)
+        except Exception:
+            return Response("Internal server error", status=500)
+
+    image_folder = Path(Config.IMAGE_FOLDER).resolve()
+    full_path = (image_folder / area / rel).resolve()
+    if not full_path.is_relative_to(image_folder) or not full_path.is_file():
+        return Response("Image not found", status=404)
+    return send_file(full_path)
 
 
 _sp_url_cache: dict[str, tuple[str, float]] = {}  # key → (url, expires_at)
@@ -5647,6 +5740,7 @@ def api_upload_process():
     """SSE stream — run the full pipeline for one staged file."""
     file_id = request.args.get("id", "")
     category = request.args.get("category", "") or None  # None = AI determines it
+    source = request.args.get("source", "").strip() or None  # None = process_image defaults to Internal
 
     from src.image_processor import CATEGORIES, process_image
     staged = _staged_lookup(file_id)
@@ -5707,7 +5801,7 @@ def api_upload_process():
                     storage_mode=storage_mode,
                     on_progress=lambda msg: q.put(("progress", msg)),
                     category=category,
-                    source="Internal",
+                    source=source,
                 )
                 q.put(("done", result))
             except Exception:

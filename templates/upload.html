@@ -321,6 +321,20 @@
 
     <!-- Category determined automatically by Claude -->
 
+    <div class="field-row">
+      <label for="upload-source">Source</label>
+      <select id="upload-source">
+        <option value="Internal" selected>Internal (our own photo)</option>
+        <option value="AdobeStock">Adobe Stock</option>
+        <option value="ShutterStock">Shutterstock</option>
+        <option value="Pexels">Pexels</option>
+        <option value="Unsplash">Unsplash</option>
+        <option value="Pixabay">Pixabay</option>
+        <option value="Other">Other</option>
+      </select>
+      <span class="hint">Where did this image come from? Applies to all files in this batch.</span>
+    </div>
+
     <!-- Selected files list -->
     <div id="file-list"></div>
 
@@ -357,6 +371,7 @@
   window.PROXIMA_CSRF_TOKEN = {{ csrf_token|tojson }};
 
   const dropZone    = document.getElementById('drop-zone');
+  const sourceSelect = document.getElementById('upload-source');
   const fileInput   = document.getElementById('file-input');
   const fileListEl  = document.getElementById('file-list');
   const processBtn  = document.getElementById('process-btn');
@@ -532,7 +547,7 @@
       card.setStatus('running');
 
       await new Promise(resolve => {
-        const url = `/api/upload/process?id=${encodeURIComponent(s.id)}&csrf_token=${encodeURIComponent(window.PROXIMA_CSRF_TOKEN)}`;
+        const url = `/api/upload/process?id=${encodeURIComponent(s.id)}&source=${encodeURIComponent(sourceSelect.value)}&csrf_token=${encodeURIComponent(window.PROXIMA_CSRF_TOKEN)}`;
         const es = new EventSource(url);
         let finished = false;
 
