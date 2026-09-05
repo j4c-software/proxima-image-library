@@ -869,6 +869,10 @@
           <input id="dry-run" type="checkbox" checked />
           Dry run
         </label>
+        <label class="check-row">
+          <input id="allow-missing-attribution" type="checkbox" />
+          Catalog without attribution (stock-library files only — confirm license terms first)
+        </label>
         <button id="run" class="btn">Run Sync</button>
       </div>
 
@@ -879,6 +883,7 @@
         <h2>Run Summary</h2>
         <div id="summary-grid" class="summary-grid"></div>
         <div id="orphan-wrap" class="orphan-list" style="display:none;"></div>
+        <div id="attribution-wrap" class="orphan-list" style="display:none;"></div>
       </div>
     </section>
 
@@ -1601,12 +1606,14 @@
     const runBtn = document.getElementById('run');
     const sourceSelect = document.getElementById('source');
     const dryRunInput = document.getElementById('dry-run');
+    const allowMissingAttributionInput = document.getElementById('allow-missing-attribution');
     const logEl = document.getElementById('log');
     const logStatusEl = document.getElementById('log-status');
     let logLineCount = 0;
     const summaryEl = document.getElementById('summary');
     const summaryGridEl = document.getElementById('summary-grid');
     const orphanWrapEl = document.getElementById('orphan-wrap');
+    const attributionWrapEl = document.getElementById('attribution-wrap');
 
     const ingestRunBtn = document.getElementById('ingest-run-btn');
     const ingestCancelBtn = document.getElementById('ingest-cancel-btn');
@@ -1970,21 +1977,39 @@
       summaryGridEl.innerHTML = '';
       orphanWrapEl.style.display = 'none';
       orphanWrapEl.innerHTML = '';
+      attributionWrapEl.style.display = 'none';
+      attributionWrapEl.innerHTML = '';
     }
 
     function renderSummary(result) {
-      summaryGridEl.innerHTML = [
+      const rows = [
         `Source filter: ${result.source_filter}`,
         `Unprocessed High-Res found: ${result.unprocessed_high_res_found}`,
         `Cataloged: ${result.processed}`,
         `Failed: ${result.failed}`,
         `Orphaned WebP files: ${result.orphaned_webp_count}`,
-      ].map(v => `<div>${v}</div>`).join('');
+      ];
+      if (result.dry_run) {
+        rows.push(`Needs attribution (would be held): ${result.needs_attribution_count ?? 0}`);
+      } else {
+        rows.push(`Held — stock source, no attribution on record: ${result.held_for_attribution ?? 0}`);
+      }
+      summaryGridEl.innerHTML = rows.map(v => `<div>${v}</div>`).join('');
 
       if (Array.isArray(result.orphaned_webp) && result.orphaned_webp.length) {
         orphanWrapEl.style.display = 'block';
         orphanWrapEl.innerHTML = result.orphaned_webp.map(v => `<div>${v}</div>`).join('');
       }
+
+      if (Array.isArray(result.needs_attribution_files) && result.needs_attribution_files.length) {
+        attributionWrapEl.style.display = 'block';
+        attributionWrapEl.innerHTML = [
+          '<div><strong>Needs attribution — catalog via the stock-photo search tool, '
+            + 'or check "Catalog without attribution" once license terms are confirmed:</strong></div>',
+          ...result.needs_attribution_files.map(v => `<div>${v}</div>`),
+        ].join('');
+      }
+
       summaryEl.style.display = 'block';
     }
 
@@ -3297,6 +3322,7 @@
       const source = sourceSelect.value.trim();
       if (source) params.set('source', source);
       if (dryRunInput.checked) params.set('dry_run', 'true');
+      if (allowMissingAttributionInput.checked) params.set('allow_missing_attribution', 'true');
       params.set('csrf_token', window.PROXIMA_CSRF_TOKEN);
 
       const es = new EventSource(`/api/maintenance/sync-highres?${params.toString()}`);

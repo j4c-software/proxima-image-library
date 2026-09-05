@@ -4457,6 +4457,7 @@ def api_maintenance_sync_highres():
     """SSE stream — catalog unprocessed High-Res files and report orphaned WebP assets."""
     requested_source = request.args.get("source", "").strip()
     dry_run = request.args.get("dry_run", "").strip().lower() in {"1", "true", "yes"}
+    allow_missing_attribution = request.args.get("allow_missing_attribution", "").strip().lower() in {"1", "true", "yes"}
 
     def generate():
         yield "data: [START]\n\n"
@@ -4516,6 +4517,7 @@ def api_maintenance_sync_highres():
                             "source": src,
                             "filename": base,
                             "sp_path": sp_path,
+                            "needs_attribution": src != "Internal",
                         })
 
                     for _sp_path, rel in webp_items:
@@ -4548,6 +4550,7 @@ def api_maintenance_sync_highres():
                                 "source": src,
                                 "filename": file_path.name,
                                 "path": str(file_path),
+                                "needs_attribution": src != "Internal",
                             })
 
                     if webp_root.exists():
@@ -4561,14 +4564,24 @@ def api_maintenance_sync_highres():
 
                 q.put(("progress", f"Found {len(candidates)} unprocessed High-Res file(s)"))
 
+                needs_attribution = [c for c in candidates if c["needs_attribution"]]
+                if needs_attribution and not allow_missing_attribution:
+                    q.put(("progress",
+                           f"{len(needs_attribution)} file(s) are from a stock library with no attribution "
+                           "on record — they will be held, not cataloged. Check 'Catalog without attribution' "
+                           "to override once you've confirmed the license terms."))
+
                 if dry_run:
                     summary = {
                         "processed": 0,
                         "failed": 0,
                         "unprocessed_high_res_found": len(candidates),
+                        "needs_attribution_count": len(needs_attribution),
+                        "needs_attribution_files": sorted(c["filename"] for c in needs_attribution),
                         "orphaned_webp_count": len(orphaned_webp),
                         "orphaned_webp": sorted(orphaned_webp),
                         "source_filter": target_source or "all",
+                        "allow_missing_attribution": allow_missing_attribution,
                         "dry_run": True,
                     }
                     q.put(("done", summary))
@@ -4576,6 +4589,7 @@ def api_maintenance_sync_highres():
 
                 processed = 0
                 failed = 0
+                held = 0
                 total = len(candidates)
                 # Pre-load filenames once to avoid O(N) record_exists calls per slug
                 existing_filenames: set = {
@@ -4584,6 +4598,13 @@ def api_maintenance_sync_highres():
                     if r.get("fields", {}).get("Filename")
                 }
                 for idx, item in enumerate(candidates, 1):
+                    if item["needs_attribution"] and not allow_missing_attribution:
+                        held += 1
+                        q.put(("progress",
+                               f"[{idx}/{total}] HELD {item['rel']}: {item['source']} source has no attribution "
+                               "on record — catalog it via the stock-photo search tool, or re-run with "
+                               "'Catalog without attribution' checked"))
+                        continue
                     q.put(("progress", f"[{idx}/{total}] Cataloging {item['rel']}"))
                     try:
                         file_bytes = load_bytes(item)
@@ -4609,10 +4630,12 @@ def api_maintenance_sync_highres():
                 summary = {
                     "processed": processed,
                     "failed": failed,
+                    "held_for_attribution": held,
                     "unprocessed_high_res_found": total,
                     "orphaned_webp_count": len(orphaned_webp),
                     "orphaned_webp": sorted(orphaned_webp),
                     "source_filter": target_source or "all",
+                    "allow_missing_attribution": allow_missing_attribution,
                     "dry_run": False,
                 }
                 q.put(("done", summary))
